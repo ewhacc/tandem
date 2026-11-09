@@ -1,0 +1,13 @@
+Tandem-vLLM
+Copyright 2026 the Tandem authors
+
+This product is a set of modified files for vLLM and includes software developed by others:
+
+- vLLM (https://github.com/vllm-project/vllm), Apache License 2.0. The files under engine/ are modified
+  versions of vLLM 0.31.0 source files, or new files added to it.
+- vLLM-Moet (https://github.com/kacper-daftcode/vLLM-Moet), Apache License 2.0. Tandem's expert-offload engine
+  (2-bit expert planes, moe_w2 kernels and their generators, GPU expert cache, FP4 tier and confidence gate)
+  derives from it; the SM120 cubins under cubins/ are built from its kernel generators.
+- DeepGEMM (https://github.com/deepseek-ai/DeepGEMM, vLLM fork), MIT License; deps/deepgemm/.
+- FlashInfer (https://github.com/flashinfer-ai/flashinfer), Apache License 2.0; tools/patch_flashinfer_dsv41.py
+  edits its installed sources.

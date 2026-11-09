@@ -1,0 +1,96 @@
+diff --git a/csrc/apis/attention.hpp b/csrc/apis/attention.hpp
+index 1d0903f..432bf37 100644
+--- a/csrc/apis/attention.hpp
++++ b/csrc/apis/attention.hpp
+@@ -406,7 +406,8 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
+     // Dispatch implementation
+     const auto arch_major = jit->device.get_arch_major();
+     if (arch_major == 12) {
+-        DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);
++        // DSV4.1 (vLLM-Moet): 128-row pages on the compress_ratio=1 indexer layers.
++        DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128);
+         DG_HOST_ASSERT(not is_varlen or (next_n == 1 and indices.value().dim() == 1 and
+                                          indices.value().size(0) == batch_size and
+                                          indices.value().is_contiguous() and
+@@ -483,8 +484,8 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
+     const auto [num_kv_blocks, block_kv, num_heads_kv, head_dim_with_sf] = get_shape<4>(fused_kv_cache);
+     DG_HOST_ASSERT((arch_major == 10 and (block_kv == 32 or block_kv == 64 or block_kv == 128)) or
+                    (arch_major == 9 and (block_kv == 32 or block_kv == 64)) or
+-                   (arch_major == 12 and ((is_fp4 and (block_kv == 32 or block_kv == 64)) or
+-                                          (not is_fp4 and block_kv == 64))));
++                   (arch_major == 12 and ((is_fp4 and (block_kv == 32 or block_kv == 64 or block_kv == 128)) or
++                                          (not is_fp4 and (block_kv == 64 or block_kv == 128)))));  // DSV4.1 (vLLM-Moet)
+     const int kv_head_dim = is_fp4 ? head_dim / 2 : head_dim;
+     const int sf_bytes = static_cast<int>(is_mx_sf ? sizeof(int) : sizeof(float));
+     DG_HOST_ASSERT(num_heads_kv == 1 and head_dim_with_sf == kv_head_dim + sf_bytes);
+diff --git a/csrc/apis/layout.hpp b/csrc/apis/layout.hpp
+index e374967..67a66bc 100644
+--- a/csrc/apis/layout.hpp
++++ b/csrc/apis/layout.hpp
+@@ -153,9 +153,11 @@ static void register_apis(pybind11::module_& m) {
+     m.def("get_mk_alignment_for_contiguous_layout", [&]() {
+         return heuristics_runtime->get_mk_alignment_for_contiguous_layout();
+     });
+-    m.def("get_theoretical_mk_alignment_for_contiguous_layout", [&](const std::optional<int>& expected_m) {
+-        return heuristics_runtime->get_theoretical_mk_alignment_for_contiguous_layout(expected_m);
+-    }, py::arg("expected_m") = std::nullopt);
++    // DSV4.1 (vLLM-Moet): num_groups as in nv_dev (vLLM passes M*top_k and the local expert count).
++    m.def("get_theoretical_mk_alignment_for_contiguous_layout", [&](const std::optional<int>& expected_m,
++                                                                       const std::optional<int>& num_groups) {
++        return heuristics_runtime->get_theoretical_mk_alignment_for_contiguous_layout(expected_m, num_groups);
++    }, py::arg("expected_m") = std::nullopt, py::arg("num_groups") = std::nullopt);
+ }
+ 
+ } // namespace deep_gemm::layout
+diff --git a/csrc/jit_kernels/heuristics/runtime.hpp b/csrc/jit_kernels/heuristics/runtime.hpp
+index 417c612..615ac78 100644
+--- a/csrc/jit_kernels/heuristics/runtime.hpp
++++ b/csrc/jit_kernels/heuristics/runtime.hpp
+@@ -54,7 +54,22 @@ public:
+         return mk_alignment_for_contiguous_layout;
+     }
+ 
+-    static int get_theoretical_mk_alignment_for_contiguous_layout(const std::optional<int>& expected_m) {
++    // DSV4.1 (vLLM-Moet): SM120 per-group BLOCK_M (nv_dev's policy, not carried by the port
++    // of the SM120 kernels): BLOCK_M in {64, 128} (kMWarps(4) x MMA_M(16)); pad each
++    // group of the contiguous grouped layout to the smallest tile covering its expected
++    // rows (MoE decode: 64) instead of the legacy 128, which doubles the grouped GEMM time.
++    static int get_theoretical_mk_alignment_for_contiguous_layout(const std::optional<int>& expected_m,
++                                                                    const std::optional<int>& num_groups = std::nullopt) {
++        if (jit->device.get_arch_major() == 12) {
++            int block_m = 128;
++            if (expected_m.has_value()) {
++                int per_group_m = expected_m.value();
++                if (num_groups.has_value() and num_groups.value() > 0)
++                    per_group_m = (per_group_m + num_groups.value() - 1) / num_groups.value();
++                for (; block_m > 64 and block_m - 64 >= per_group_m; block_m -= 64);
++            }
++            return block_m;
++        }
+         if (jit->device.get_arch_major() != 10)
+             return kLegacyMKAlignmentForContiguousLayout;
+ 
+diff --git a/csrc/jit_kernels/impls/sm120_mqa_logits.hpp b/csrc/jit_kernels/impls/sm120_mqa_logits.hpp
+index 4bf5033..779b7e9 100644
+--- a/csrc/jit_kernels/impls/sm120_mqa_logits.hpp
++++ b/csrc/jit_kernels/impls/sm120_mqa_logits.hpp
+@@ -483,7 +483,8 @@ static void sm120_fp8_paged_mqa_logits(
+     const int num_groups = split_kv / block_kv;
+     const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;
+     DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
+-    DG_HOST_ASSERT(block_kv == 64);
++    // DSV4.1 (vLLM-Moet): 128-row pages -> kNumGroups = 1 (eight 16-row MMA warps).
++    DG_HOST_ASSERT(block_kv == 64 or block_kv == 128);
+     DG_HOST_ASSERT(split_kv == 128 and logits_stride % split_kv == 0);
+ 
+     const auto tensor_map_q = make_tma_2d_desc(
+@@ -623,7 +624,8 @@ static void sm120_fp4_paged_mqa_logits(
+     const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;
+     DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
+     DG_HOST_ASSERT(split_kv == 128 and logits_stride % split_kv == 0);
+-    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);
++    // DSV4.1 (vLLM-Moet): 128-row MXFP4 indexer pages -> kNumGroups = 1.
++    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128);
+     DG_HOST_ASSERT(head_dim == 128);
+ 
+     const auto tensor_map_q = make_tma_2d_desc(

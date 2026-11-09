@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tandem Panel</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --ink: #1b1f24; --mute: #67707b; --line: #e3e6ea;
+  --gpu: #2f7d4f; --ram: #3a6fb0; --nvme: #c4572e; --acc: #6a4fb3; --warn: #b8860b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111418; --card: #1a1e24; --ink: #e6e8eb; --mute: #8d96a0; --line: #2a3038;
+    --gpu: #52b27a; --ram: #6b9be0; --nvme: #e98157; --acc: #a28be6; --warn: #e0b04a;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #111418; --card: #1a1e24; --ink: #e6e8eb; --mute: #8d96a0; --line: #2a3038;
+  --gpu: #52b27a; --ram: #6b9be0; --nvme: #e98157; --acc: #a28be6; --warn: #e0b04a;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px;
+  padding: 16px; border-bottom: 1px solid var(--line); }
+header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+header .sub { color: var(--mute); font-size: 13px; }
+#status { margin-left: auto; font-size: 13px; color: var(--mute); }
+#status.bad { color: var(--nvme); }
+main { padding: 16px; display: grid; gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); max-width: 1400px; margin: 0 auto; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-width: 0; }
+.card h2 { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--mute);
+  text-transform: uppercase; letter-spacing: .04em; }
+.wide { grid-column: 1 / -1; }
+.kpis { display: flex; flex-wrap: wrap; gap: 8px 28px; }
+.kpi .v { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.kpi .l { font-size: 12px; color: var(--mute); }
+canvas { width: 100%; height: 150px; display: block; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--mute); margin-top: 6px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.flow { display: flex; height: 24px; margin-bottom: 6px; border-radius: 5px; overflow: hidden; background: var(--line); }
+.flow div { transition: flex-grow .6s ease; display: flex; align-items: center; justify-content: center;
+  color: #fff; font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+td { padding: 3px 0; border-bottom: 1px solid var(--line); }
+td:last-child { text-align: right; }
+.note { font-size: 12px; color: var(--mute); margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Tandem</h1><span class="sub" id="model">waiting for stats</span>
+  <span id="status">connecting</span>
+</header>
+<main>
+  <section class="card wide">
+    <h2>Now</h2>
+    <div class="kpis">
+      <div class="kpi"><div class="v" id="k-gen">-</div><div class="l">generated tok/s</div></div>
+      <div class="kpi"><div class="v" id="k-pre">-</div><div class="l">prompt tok/s</div></div>
+      <div class="kpi"><div class="v" id="k-run">-</div><div class="l">running / waiting</div></div>
+      <div class="kpi"><div class="v" id="k-kv">-</div><div class="l">KV cache used</div></div>
+      <div class="kpi"><div class="v" id="k-cold">-</div><div class="l">cold read / expert</div></div>
+      <div class="kpi"><div class="v" id="k-hint">-</div><div class="l">read-ahead hints used</div></div>
+    </div>
+  </section>
+
+  <section class="card wide">
+    <h2>Where the experts come from</h2>
+    <div class="flow" id="flow">
+      <div id="f-gpu" style="background:var(--gpu)"></div>
+      <div id="f-ram" style="background:var(--ram)"></div>
+      <div id="f-nvme" style="background:var(--nvme)"></div>
+    </div>
+    <canvas id="c-src"></canvas>
+    <div class="legend">
+      <span><i style="background:var(--gpu)"></i>GPU cache</span>
+      <span><i style="background:var(--ram)"></i>pinned RAM (CPU)</span>
+      <span><i style="background:var(--nvme)"></i>NVMe, cold (CPU)</span>
+    </div>
+    <div class="note">Share of routed expert computations per second, last 10 minutes.</div>
+  </section>
+
+  <section class="card">
+    <h2>Throughput</h2>
+    <canvas id="c-tok"></canvas>
+    <div class="legend"><span><i style="background:var(--acc)"></i>generated tok/s</span></div>
+  </section>
+
+  <section class="card">
+    <h2>Disk read</h2>
+    <canvas id="c-disk"></canvas>
+    <div class="legend" id="l-disk"></div>
+  </section>
+
+  <section class="card">
+    <h2>CPU experts</h2>
+    <canvas id="c-cpu"></canvas>
+    <div class="legend"><span><i style="background:var(--ram)"></i>job time (ms)</span>
+      <span><i style="background:var(--nvme)"></i>blocked on cold reads (ms)</span></div>
+  </section>
+
+  <section class="card">
+    <h2>GPU</h2>
+    <canvas id="c-gpu"></canvas>
+    <div class="legend"><span><i style="background:var(--gpu)"></i>utilization %</span>
+      <span><i style="background:var(--warn)"></i>power (% of peak seen)</span></div>
+    <table id="t-gpu"></table>
+  </section>
+
+  <section class="card">
+    <h2>Host</h2>
+    <canvas id="c-host"></canvas>
+    <div class="legend"><span><i style="background:var(--acc)"></i>CPU busy %</span></div>
+    <table id="t-host"></table>
+  </section>
+
+  <section class="card">
+    <h2>Engine counters</h2>
+    <table id="t-eng"></table>
+  </section>
+</main>
+<script>
+"use strict";
+const SPAN = 600, POLL = 1000;           // seconds of history, poll interval (ms)
+const key = new URLSearchParams(location.hash.slice(1)).get("key");
+const hdr = key ? { Authorization: "Bearer " + key } : {};
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const $ = id => document.getElementById(id);
+const hist = [];                          // {t, ...rates}
+let prev = null, prevM = null, peakW = 1;
+
+function fmt(v, d = 1) { return v == null || !isFinite(v) ? "-" : v.toFixed(d); }
+function gib(b) { return b == null ? "-" : (b / 2 ** 30).toFixed(1) + " GiB"; }
+
+function promSum(text, name) {
+  let s = 0, hit = false;
+  for (const line of text.split("\n")) {
+    if (line.startsWith(name) && (line[name.length] === "{" || line[name.length] === " ")) {
+      const v = parseFloat(line.slice(line.lastIndexOf(" ") + 1));
+      if (isFinite(v)) { s += v; hit = true; }
+    }
+  }
+  return hit ? s : null;
+}
+
+function rate(a, b, dt) { return a == null || b == null ? null : Math.max(0, (a - b) / dt); }
+const g = (o, p) => p.split(".").reduce((x, k) => (x == null ? x : x[k]), o);
+
+function sample(s, m) {
+  const r = { t: s.t };
+  if (prev) {
+    const dt = Math.max(1e-3, s.t - prev.s.t);
+    if (m && prevM) {
+      r.gen = rate(promSum(m, "vllm:generation_tokens_total"), promSum(prevM, "vllm:generation_tokens_total"), dt);
+      r.pre = rate(promSum(m, "vllm:prompt_tokens_total"), promSum(prevM, "vllm:prompt_tokens_total"), dt);
+    }
+    const e = s.engine, pe = prev.s.engine;
+    if (e && pe) {
+      for (const k of ["gpu", "ram", "nvme"])
+        r[k] = rate(g(e, "routes." + k), g(pe, "routes." + k), dt);
+      const dj = g(e, "cpu.jobs") - g(pe, "cpu.jobs");
+      if (dj > 0) {
+        r.job = (g(e, "cpu.busy_ns") - g(pe, "cpu.busy_ns")) / dj / 1e6;
+        r.blk = (g(e, "cpu.blocked_ns") - g(pe, "cpu.blocked_ns")) / dj / 1e6;
+      }
+      const dc = g(e, "cpu.cold_experts") - g(pe, "cpu.cold_experts");
+      if (dc > 0) r.coldms = (g(e, "cpu.cold_ns") - g(pe, "cpu.cold_ns")) / dc / 1e6;
+      const dh = g(e, "cpu.hints") - g(pe, "cpu.hints");
+      if (dh > 0) r.hintu = 100 * (g(e, "cpu.hints_used") - g(pe, "cpu.hints_used")) / dh;
+    }
+    r.disk = {};
+    for (const [d, v] of Object.entries(s.disk || {})) {
+      const p = (prev.s.disk || {})[d];
+      if (p) r.disk[d] = (v.r - p.r) / dt / 1e6;
+    }
+    const c = s.cpu, pc = prev.s.cpu;
+    if (c && pc && c.total > pc.total) r.cpu = 100 * (c.busy - pc.busy) / (c.total - pc.total);
+    const gp = (s.gpus || [])[0];
+    if (gp && gp.util != null) {
+      r.gutil = gp.util; peakW = Math.max(peakW, gp.power_w || 0);
+      r.gpow = 100 * (gp.power_w || 0) / peakW;
+    }
+  }
+  prev = { s }; prevM = m;
+  return r;
+}
+
+function chart(id, series, opts = {}) {
+  const cv = $(id), dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== w * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+  const x = cv.getContext("2d");
+  x.setTransform(dpr, 0, 0, dpr, 0, 0);
+  x.clearRect(0, 0, w, h);
+  const now = hist.length ? hist[hist.length - 1].t : 0;
+  const pts = hist.filter(p => p.t > now - SPAN);
+  let max = opts.max || 0;
+  if (!opts.max) for (const sr of series) for (const p of pts) { const v = sr.f(p); if (v != null) max = Math.max(max, v); }
+  max = max > 0 ? max * 1.1 : 1;
+  const X = t => w - (now - t) / SPAN * w, Y = v => h - 16 - v / max * (h - 24);
+  x.strokeStyle = css("--line"); x.lineWidth = 1; x.fillStyle = css("--mute"); x.font = "11px system-ui";
+  for (const f of [0, 0.5, 1]) {
+    const yy = Y(max / 1.1 * f);
+    x.beginPath(); x.moveTo(0, yy); x.lineTo(w, yy); x.stroke();
+    x.fillText(fmt(max / 1.1 * f, max < 10 ? 1 : 0), 2, yy - 2);
+  }
+  x.fillText("-10 min", 2, h - 3); x.fillText("now", w - 24, h - 3);
+  for (const sr of series) {
+    x.strokeStyle = css(sr.c); x.lineWidth = 1.8; x.beginPath();
+    let on = false;
+    for (const p of pts) {
+      const v = sr.f(p);
+      if (v == null) { on = false; continue; }
+      on ? x.lineTo(X(p.t), Y(v)) : x.moveTo(X(p.t), Y(v)); on = true;
+    }
+    x.stroke();
+  }
+}
+
+function stacked(id) {                     // share of routed computations by source
+  const cv = $(id), dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== w * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+  const x = cv.getContext("2d");
+  x.setTransform(dpr, 0, 0, dpr, 0, 0); x.clearRect(0, 0, w, h);
+  const now = hist.length ? hist[hist.length - 1].t : 0;
+  const pts = hist.filter(p => p.t > now - SPAN && p.gpu != null);
+  const X = t => w - (now - t) / SPAN * w, H = h - 14;
+  const keys = ["gpu", "ram", "nvme"], cols = ["--gpu", "--ram", "--nvme"];
+  for (let k = keys.length - 1; k >= 0; k--) {
+    x.fillStyle = css(cols[k]); x.beginPath(); let started = false;
+    for (const p of pts) {
+      const tot = p.gpu + p.ram + p.nvme; if (!(tot > 0)) continue;
+      let top = 0; for (let j = 0; j <= k; j++) top += p[keys[j]];
+      const yy = H - top / tot * H;
+      started ? x.lineTo(X(p.t), yy) : (x.moveTo(X(p.t), H), x.lineTo(X(p.t), yy)); started = true;
+    }
+    if (started) { x.lineTo(X(pts[pts.length - 1].t), H); x.closePath(); x.fill(); }
+  }
+  x.fillStyle = css("--mute"); x.font = "11px system-ui";
+  x.fillText("-10 min", 2, h - 2); x.fillText("now", w - 24, h - 2);
+}
+
+function rows(id, list) {
+  $(id).innerHTML = list.filter(r => r[1] != null && r[1] !== "-")
+    .map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+}
+
+function render(s, m) {
+  const last = hist[hist.length - 1] || {};
+  const e = s.engine;
+  $("model").textContent = e && e.cfg ? [e.cfg.model, e.cfg.shape].filter(Boolean).join(" · ")
+    : "engine stats not available (counters from host only)";
+  $("k-gen").textContent = fmt(last.gen);
+  $("k-pre").textContent = fmt(last.pre, 0);
+  if (m) {
+    const run = promSum(m, "vllm:num_requests_running"), wait = promSum(m, "vllm:num_requests_waiting");
+    $("k-run").textContent = run == null ? "-" : `${run} / ${wait ?? 0}`;
+    const kv = promSum(m, "vllm:kv_cache_usage_perc");
+    $("k-kv").textContent = kv == null ? "-" : fmt(100 * kv, 0) + "%";
+  }
+  $("k-cold").textContent = last.coldms == null ? "-" : fmt(last.coldms) + " ms";
+  $("k-hint").textContent = last.hintu == null ? "-" : fmt(last.hintu, 0) + "%";
+
+  const tot = (last.gpu || 0) + (last.ram || 0) + (last.nvme || 0);
+  // no routed decode work this second (prompt processing, idle): keep the last bar
+  if (tot > 0) for (const k of ["gpu", "ram", "nvme"]) {
+    const sh = tot > 0 ? (last[k] || 0) / tot : 0, el = $("f-" + k);
+    el.style.flexGrow = Math.max(sh, 0.0001); el.textContent = sh > 0.06 ? fmt(100 * sh, 0) + "%" : "";
+  }
+
+  chart("c-tok", [{ f: p => p.gen, c: "--acc" }]);
+  const disks = Object.keys(last.disk || {});
+  const dcol = ["--nvme", "--ram", "--gpu", "--warn", "--acc"];
+  chart("c-disk", disks.map((d, i) => ({ f: p => p.disk && p.disk[d], c: dcol[i % 5] })));
+  $("l-disk").innerHTML = disks.map((d, i) => `<span><i style="background:var(${dcol[i % 5]})"></i>${d} MB/s</span>`).join("");
+  chart("c-cpu", [{ f: p => p.job, c: "--ram" }, { f: p => p.blk, c: "--nvme" }]);
+  chart("c-gpu", [{ f: p => p.gutil, c: "--gpu" }, { f: p => p.gpow, c: "--warn" }], { max: 100 });
+  chart("c-host", [{ f: p => p.cpu, c: "--acc" }], { max: 100 });
+  stacked("c-src");
+
+  rows("t-gpu", (s.gpus || []).flatMap(gp => [
+    [`GPU ${gp.i} ${gp.name || ""}`, gp.mem_used == null ? "-" : `${gib(gp.mem_used)} / ${gib(gp.mem_total)}`],
+    [`GPU ${gp.i} power · temp`, gp.power_w == null ? "-" : `${fmt(gp.power_w, 0)} W · ${gp.temp_c} °C`]]));
+  const mm = s.mem || {};
+  rows("t-host", [
+    ["RAM available", mm.MemAvailable && `${gib(mm.MemAvailable)} of ${gib(mm.MemTotal)}`],
+    ["page cache", mm.Cached && gib(mm.Cached)],
+    ["locked / unevictable", mm.Unevictable && gib(mm.Unevictable)],
+    ["CPUs", s.cpu && s.cpu.n]]);
+  rows("t-eng", e ? [
+    ["CPU threads · ISA", e.cfg && `${e.cfg.threads} · ${e.cfg.isa}`],
+    ["experts pinned in RAM", e.cfg && e.cfg.pinned],
+    ["GPU expert cache", e.cfg && e.cfg.gpu_cache],
+    ["CPU layer jobs", g(e, "cpu.jobs")],
+    ["cold reads (experts)", g(e, "cpu.cold_experts")],
+    ["read-ahead hints · stale chunks", g(e, "cpu.hints") != null ? `${g(e, "cpu.hints")} · ${g(e, "cpu.pf_drop")}` : null],
+    ["Engram requests", g(e, "engram.req")],
+    ["gate fires / steps", g(e, "gate.fires") != null ? `${g(e, "gate.fires")} / ${g(e, "gate.steps")}` : null],
+    ["replays", g(e, "base.replays")],
+  ] : [["engine snapshot", "not available"]]);
+}
+
+async function tick() {
+  try {
+    const [rs, rm] = await Promise.all([
+      fetch("stats", { headers: hdr, cache: "no-store" }),
+      fetch("../metrics", { cache: "no-store" }).catch(() => null)]);
+    if (rs.status === 401) throw new Error("API key needed: open /tandem/#key=...");
+    if (!rs.ok) throw new Error("stats HTTP " + rs.status);
+    const s = await rs.json();
+    const m = rm && rm.ok ? await rm.text() : null;
+    hist.push(sample(s, m));
+    while (hist.length && hist[0].t < s.t - SPAN - 5) hist.shift();
+    render(s, m);
+    $("status").textContent = "live · " + new Date(s.t * 1000).toLocaleTimeString();
+    $("status").className = "";
+  } catch (err) {
+    $("status").textContent = err.message || "server not reachable";
+    $("status").className = "bad";
+  }
+  setTimeout(tick, POLL);
+}
+tick();
+</script>
+</body>
+</html>
