@@ -91,10 +91,12 @@ FI=$("$VPY" -c "import importlib.metadata as m; print(m.version('flashinfer-pyth
 SP=$("$VPY" -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
 
 # ---- 3. Tandem engine files over the wheel
-if git -C "$SRC" rev-parse --git-dir > /dev/null 2>&1; then   # checkout or worktree
+if [ -f "$SRC/TANDEM_FILES" ]; then   # release tree (also when it sits in a git clone)
+  FILES=$(cat "$SRC/TANDEM_FILES")
+elif git -C "$SRC" rev-parse --verify -q "v$VLLM_VER" > /dev/null; then   # dev checkout / worktree
   FILES=$(git -C "$SRC" diff --name-only "v$VLLM_VER" HEAD -- 'vllm/*.py' 'vllm/*.cpp' 'vllm/*.html')
 else
-  FILES=$(cat "$SRC/TANDEM_FILES")
+  die "$SRC: no TANDEM_FILES and no v$VLLM_VER tag to diff against"
 fi
 n=0
 for f in $FILES; do
