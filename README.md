@@ -43,7 +43,7 @@ memory bandwidth, not PCIe, sets the decode speed.
 git clone https://github.com/ewhacc/tandem && cd tandem
 tools/install_tandem.sh --check          # prerequisites only
 tools/install_tandem.sh                  # venv at ~/.venvs/tandem (stock vllm==0.31.0 wheel + Tandem files)
-huggingface-cli download ewhacc/DeepSeek-V4.1-Flash-Tandem-VQ2 --local-dir ~/models/v41-tandem
+hf download ewhacc/DeepSeek-V4.1-Flash-1017-Tandem-VQ2 --local-dir ~/models/v41-tandem
 ```
 
 The installer leaves a launcher, `~/.venvs/tandem/bin/tandem-serve`. It takes `KEY=value` settings followed by
