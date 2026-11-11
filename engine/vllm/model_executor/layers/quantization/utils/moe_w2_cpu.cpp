@@ -886,6 +886,28 @@ constexpr int TMAX = 32;   // = _TCAP in moe_w2_cpu.py
 
 inline void cpu_relax() { _mm_pause(); }
 
+// Idle wait for the polling threads: spin `spin` times, then 20 us naps (next layer or step comes soon), and after
+// VLLM_MOE_W2_CPU_IDLE_MS (default 50) without work, 1 ms naps. Without the last stage an idle server kept every
+// worker at ~11% CPU (IDLE1: 6.5 cores on a 60-thread epyc, ~1.4 on a 14600KF); its cost is up to ~1 ms on the
+// first job after a pause. 0 = 20 us naps forever.
+inline long idle_ms_cfg() {
+  static const long v = [] { const char* e = getenv("VLLM_MOE_W2_CPU_IDLE_MS"); return e ? atol(e) : 50L; }();
+  return v;
+}
+struct IdleWait {
+  long n = 0;
+  std::chrono::steady_clock::time_point t0;
+  void reset() { n = 0; }
+  void wait(long spin) {
+    if (++n <= spin) { cpu_relax(); return; }
+    auto now = std::chrono::steady_clock::now();
+    if (n == spin + 1) t0 = now;
+    long lim = idle_ms_cfg();
+    bool deep = lim > 0 && now - t0 > std::chrono::milliseconds(lim);
+    std::this_thread::sleep_for(std::chrono::microseconds(deep ? 1000 : 20));
+  }
+};
+
 void pin_to(int cpu) {
   if (cpu < 0) return;
   cpu_set_t s;
@@ -1074,15 +1096,14 @@ struct Engine {
   void worker(int tid) {
     pin_to(cpus[tid]);
     uint64_t seen = 0;
-    long idle = 0;
+    IdleWait idle;
     while (!stop.load(std::memory_order_relaxed)) {
       uint64_t g = gen.load(std::memory_order_acquire);
       if (g == seen) {
-        if (++idle > 200000) std::this_thread::sleep_for(std::chrono::microseconds(20));
-        else cpu_relax();
+        idle.wait(200000);
         continue;
       }
-      idle = 0;
+      idle.reset();
       seen = g;
       units(phase, tid);
       done.fetch_add(1, std::memory_order_acq_rel);
@@ -1123,7 +1144,7 @@ struct Engine {
     std::vector<int32_t> served(n_keys);
     for (int k = 0; k < n_keys; k++) served[k] = hhdr[(size_t)k * HDR];
     const size_t soff[5] = {0, off_s13, off_c2, off_s2, slot_bytes};
-    long idle = 0;
+    IdleWait idle;
     while (!stop.load(std::memory_order_relaxed)) {
       bool any = false;
       for (int k = 0; k < n_keys; k++) {
@@ -1165,9 +1186,8 @@ struct Engine {
         }
         if (ng) pf_cv.notify_all();
       }
-      if (any) { idle = 0; continue; }
-      if (++idle > 2000) std::this_thread::sleep_for(std::chrono::microseconds(20));
-      else cpu_relax();
+      if (any) { idle.reset(); continue; }
+      idle.wait(2000);
     }
   }
 
@@ -1366,15 +1386,14 @@ struct Engine {
     pin_to(cpus[0]);
     if (gpu) g_setctx(g_ctx);
     int64_t last = glob[0];
-    long idle = 0;
+    IdleWait idle;
     while (!stop.load(std::memory_order_relaxed)) {
       int64_t v = glob[0];
       if (v == last) {
-        if (++idle > 2000000) std::this_thread::sleep_for(std::chrono::microseconds(20));
-        else cpu_relax();
+        idle.wait(2000000);
         continue;
       }
-      idle = 0;
+      idle.reset();
       last = v;
       std::atomic_thread_fence(std::memory_order_acquire);
       if (gpu) gpu_job((int)(v & 127), (int)(v >> 7));
