@@ -37,6 +37,10 @@ GPUs other than SM120 (RTX 50xx, RTX PRO Blackwell) are not supported in 0.1.0. 
 On dual-channel desktop memory (DDR4, or DDR5 with two channels) every missed expert is streamed from RAM, so
 memory bandwidth, not PCIe, sets the decode speed.
 
+For one user on a 16–32 GB card with 64–128 GB of RAM, use the sister project
+[tandem.cpp](https://github.com/ewhacc/tandem.cpp) (a llama.cpp patch set; DeepSeek-V4.1-Flash IQ2_XS at 33 tok/s on an
+RTX 5090 + 128 GB, 14 tok/s on a 16 GB card + 64 GB). Tandem-vLLM is for many streams on a big card.
+
 ## Install
 
 ```bash
