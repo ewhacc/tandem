@@ -58,7 +58,8 @@ tandem-serve MODEL=~/models/v41-tandem BASE_GB=65.5 SPEC_N=3
 # serving, 96 GB card: up to 32 streams, no drafter
 tandem-serve MODEL=~/models/v41-tandem BASE_GB=65.5
 
-# 32 GB card + 128 GB RAM box (RTX 5090; the drafter does not fit on 32 GB)
+# 32 GB card + 128 GB RAM box (RTX 5090; up to 8 streams: STEP_T=8 is picked on cards under 48 GB;
+# the drafter does not fit on 32 GB)
 tandem-serve MODEL=~/models/v41-tandem BASE_GB=10 RAM_GB=90 ENGRAM=files
 ```
 

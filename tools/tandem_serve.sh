@@ -20,9 +20,9 @@
 #   SPEC_N=k              DSpark speculative decoding with the drafter in the package (mtp layers), k tokens;
 #                         verify steps must fit the decode graphs ((1+k)*NUM_SEQS <= STEP_T), so NUM_SEQS
 #                         defaults to 8/(1+k) (k=3: 2)
-#   STEP_T=N              largest decode step in tokens (seqs x (1+k)) the CUDA graphs cover; default 32
-#                         without a drafter (up to 32 streams), 8 with SPEC_N (a larger step with the drafter
-#                         takes GPU memory from the expert cache)
+#   STEP_T=N              largest decode step in tokens (seqs x (1+k)) the CUDA graphs cover; default 32 (up to 32
+#                         streams) without a drafter on cards with 48 GB or more, else 8 (smaller cards, or SPEC_N:
+#                         a larger step takes GPU memory from the expert cache)
 #   CHUNK=N               tokens per scheduler step (prefill chunk; --max-num-batched-tokens), default 4096
 #                         (PF1/PF2: 1.6x prefill vs 2048, survives 94k prompts at BASE 65.5 on 96 GB; 8192 needs
 #                         BASE <= 60, 16384 BASE <= 54. KV is fixed, so vLLM does not profile the prefill peak: a
@@ -57,7 +57,10 @@ export VLLM_MOE_W2_BASE_DIRECT=1 VLLM_MOE_W2_CPU=${CPU:-1}
 export VLLM_MOE_W2_BASE_POLICY=freq VLLM_MOE_W2_PROMO_HYST=1.25 VLLM_MOE_W2_DELTA_DECAY_S=30
 export VLLM_MOE_W2_FORCE_POOL=1 VLLM_MOE_W2_DELTA_PIN=1 VLLM_MOE_W2_DELTA_POLICY=need
 export VLLM_MOE_W2_REPLAY_MODE=strict VLLM_MOE_W2_BASE_MISS_TOL=0
-STEP_T=${STEP_T:-$([ -n "${SPEC_N:-}" ] && echo 8 || echo 32)}   # BT1-BT4: 32 costs nothing without a drafter
+# BT1-BT4: 32 costs nothing without a drafter on a 96 GB card; on a 32 GB card its workspace does not fit next to
+# the expert cache (pcbox1 5090: warm-up OOM at BASE 10), so cards under 48 GB default to 8 (up to 8 streams)
+GPU_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i "${GPU:-0}" 2>/dev/null | head -1 || true)
+STEP_T=${STEP_T:-$([ -n "${SPEC_N:-}" ] || [ "${GPU_MIB:-99999}" -lt 49152 ] && echo 8 || echo 32)}
 export VLLM_MOE_W2_PREFILL_T=$STEP_T VLLM_MOE_W2_GATE=0
 export VLLM_MOE_W2_STABLE_TOPK=1 VLLM_MOE_W2_ZERO_NULL_BLOCK=1
 export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_USE_BREAKABLE_CUDAGRAPH=0
