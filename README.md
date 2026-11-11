@@ -67,6 +67,9 @@ tandem-serve MODEL=~/models/v41-tandem BASE_GB=65.5
 # 32 GB card + 128 GB RAM box (RTX 5090; up to 8 streams: STEP_T=8 is picked on cards under 48 GB;
 # the drafter does not fit on 32 GB)
 tandem-serve MODEL=~/models/v41-tandem BASE_GB=10 RAM_GB=90 ENGRAM=files
+
+# same box, one user: a 1 GiB KV cache (enough for one 32k conversation) leaves room for a larger expert cache
+tandem-serve MODEL=~/models/v41-tandem BASE_GB=12 KV_GB=1 STEP_T=2 RAM_GB=90 ENGRAM=files
 ```
 
 The server speaks the OpenAI API on port 8000 (served model name `deepseek-v4-flash`). Tool calling is on, and the
@@ -106,7 +109,7 @@ System decode tok/s, all streams active (512-token GSM8K answers, thinking high)
 - At 8+ streams the drafter does not help. Serve without it. With the drafter and `STEP_T=32` the card fits only
   BASE 60.
 - RTX 5090 32 GB + i5-14600KF, 128 GB DDR4-3200 (`BASE_GB=10 RAM_GB=90 ENGRAM=files`): 16 / 18 / 20 tok/s at
-  1 / 2 / 4 streams; a 32k-token prompt waits about 2 minutes. On dual-channel DDR4 every missed expert is
+  1 / 2 / 4 streams; one user with `BASE_GB=12 KV_GB=1 STEP_T=2`: 17 tok/s; a 32k-token prompt waits about 2 minutes. On dual-channel DDR4 every missed expert is
   streamed from RAM, so memory bandwidth sets the speed.
 
 Quality (thinking low, greedy). Reference: the original FP4 model on stock vLLM 0.32 (4× H200).

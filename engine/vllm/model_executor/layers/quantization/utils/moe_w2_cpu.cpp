@@ -999,6 +999,8 @@ struct Engine {
   // pool
   std::atomic<uint64_t> gen{0};
   std::atomic<int> done{0};
+  std::atomic<long> next_unit{0};   // dynamic split: next unit of the running phase
+  bool dyn_sched = true;
   std::atomic<bool> stop{false};
   int phase = 0;
   std::vector<std::thread> th;
@@ -1035,7 +1037,19 @@ struct Engine {
     const int N13 = 2 * I, KB1 = H / 64, KB2 = I / 64, nb13 = N13 / 16, nb2 = H / 16;
     long n = ph == 0 ? (long)T * KB1 : ph == 1 ? (long)xs.size() * nb13
            : ph == 2 ? (long)ps.size() * KB2 : nb2;
-    long lo = n * tid / n_thr, hi = n * (tid + 1) / n_thr;
+    // dynamic split (default): threads take chunks of units from a shared counter, so fast cores (P-cores on
+    // hybrid CPUs) take more and no phase waits for the slowest core. Units write disjoint outputs and each is
+    // computed the same way on any thread, so results are bit-identical to the static split
+    // (VLLM_MOE_W2_CPU_DYN=0: equal shares per thread, the old behaviour).
+    const bool dyn = dyn_sched;
+    const long ch = dyn ? std::max(1L, n / ((long)n_thr * 8)) : 0;
+    long lo = dyn ? 0 : n * tid / n_thr, hi = dyn ? 0 : n * (tid + 1) / n_thr;
+    for (;;) {
+    if (dyn) {
+      lo = next_unit.fetch_add(ch, std::memory_order_relaxed);
+      if (lo >= n) break;
+      hi = std::min(n, lo + ch);
+    }
     for (long u = lo; u < hi; u++) {
       if (ph == 0) {
         int t = (int)(u / KB1), kb = (int)(u % KB1);
@@ -1090,6 +1104,8 @@ struct Engine {
           }
         }
       }
+    }
+    if (!dyn) break;
     }
   }
 
@@ -1230,6 +1246,7 @@ struct Engine {
   void run_phase(int ph) {
     phase = ph;
     done.store(0, std::memory_order_relaxed);
+    next_unit.store(0, std::memory_order_relaxed);
     gen.fetch_add(1, std::memory_order_acq_rel);
     units(ph, 0);
     while (done.load(std::memory_order_acquire) < n_thr - 1) cpu_relax();
@@ -1479,6 +1496,7 @@ int w2e_hint(void* p, void* hdr, void* ids, int stride, int n_pf) {
   e->hids = (const volatile int32_t*)ids;
   e->hstride = stride;
   if (const char* v = getenv("VLLM_MOE_W2_COLD_HINT_TOP")) e->htop = std::max(1, atoi(v));
+  if (const char* v = getenv("VLLM_MOE_W2_CPU_DYN")) e->dyn_sched = atoi(v) != 0;
   e->hint_t.assign((size_t)e->n_keys * e->n_experts, 0);
   e->hint_rk.assign((size_t)e->n_keys * e->n_experts, 0);
   e->hint_th = std::thread(&Engine::hint_loop, e);
