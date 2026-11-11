@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install Tandem-vLLM into a fresh Python venv (no Docker, no root).
 #
-#   tools/install_tandem.sh [--prefix DIR] [--src DIR] [--python python3.12] [--check]
+#   tools/install_tandem.sh [--prefix DIR] [--src DIR] [--python python3.12] [--check] [--no-link]
 #
 #   --prefix  venv to create (default ~/.venvs/tandem); must not hold another vLLM
 #   --src     engine source: the release tree's engine/ (default when present), a tree with
@@ -19,7 +19,8 @@
 #      (patch_flashinfer_dsv41.py) and DeepGEMM _C with 128-row indexer pages (prebuilt)
 #   5. SM120 cubins -> <prefix>/share/tandem/cubins
 #   6. <prefix>/bin/tandem-serve: the package launcher with this venv, the cubins and the
-#      CUDA toolkit on PATH (non-interactive shells often lack /usr/local/cuda/bin)
+#      CUDA toolkit on PATH (non-interactive shells often lack /usr/local/cuda/bin), plus a
+#      link ~/.local/bin/tandem-serve (not replaced if it points elsewhere; --no-link skips it)
 #
 # Then: tandem-serve MODEL=<package dir> BASE_GB=<GiB> ... (see tools/tandem_serve.sh).
 set -euo pipefail
@@ -32,6 +33,7 @@ CHECK=0
 while [ $# -gt 0 ]; do
   case $1 in
     --prefix) PREFIX=$2; shift 2 ;;
+    --no-link) NOLINK=1; shift ;;
     --src) SRC=$2; shift 2 ;;
     --python) PY=$2; shift 2 ;;
     --check) CHECK=1; shift ;;
@@ -143,4 +145,19 @@ chmod +x "$PREFIX/bin/tandem-serve"
 import vllm, importlib
 from vllm.model_executor.layers.quantization.utils import tandem_pkg, moe_w2_cubit
 print('vllm', vllm.__version__, '| package formats', tandem_pkg.FORMATS)")
-say "done: $PREFIX/bin/tandem-serve MODEL=<package> BASE_GB=<GiB>"
+# ---- 7. command on PATH: ~/.local/bin/tandem-serve -> the launcher
+CMD=$PREFIX/bin/tandem-serve
+if [ -z "${NOLINK:-}" ]; then
+  LB=$HOME/.local/bin; mkdir -p "$LB"
+  if { [ ! -e "$LB/tandem-serve" ] && [ ! -L "$LB/tandem-serve" ]; } || [ "$(readlink "$LB/tandem-serve")" = "$CMD" ]; then
+    ln -sfn "$CMD" "$LB/tandem-serve"
+    case ":$PATH:" in
+      *":$LB:"*) CMD=tandem-serve ;;
+      *) say "linked $LB/tandem-serve; $LB is not on PATH in this shell (Ubuntu adds it at the next login," \
+             "or: export PATH=\"$LB:\$PATH\")" ;;
+    esac
+  else
+    say "kept $LB/tandem-serve (points elsewhere); run $CMD"
+  fi
+fi
+say "done: $CMD MODEL=<package> BASE_GB=<GiB>"

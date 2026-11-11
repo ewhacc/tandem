@@ -12,6 +12,9 @@
 #                         after KV, FP4 pool and activations)
 #   GPU=0 PORT=8000 KV_GB=4 MAX_LEN=8192 NUM_SEQS=STEP_T/(1+k) CPU=1
 #   THINKING=1 REASONING_EFFORT=low|high|max   chat-template defaults
+#   TOOLS=1               OpenAI tool calling (--enable-auto-tool-choice, deepseek_v41 tool parser) and the
+#                         thinking text in its own reasoning field (deepseek_v41 reasoning parser); 0 = both off
+#                         (PT1: tool calls, tool results, streaming, thinking on/off checked)
 #   CUBIT_DIR=<dir>       SM120 kernel cubins (VLLM_MOE_W2_CUBIT_DIR)
 #   RAM_GB=N              small-RAM box: pin only the N GiB of most-routed VQ experts,
 #                         read the rest from the package files (VLLM_TANDEM_RAM_GB)
@@ -92,12 +95,14 @@ if [ "${THINKING:-1}" = 1 ]; then
 else
   CT='{"thinking":false}'
 fi
+TP=()
+[ "${TOOLS:-1}" = 1 ] && TP=(--enable-auto-tool-choice --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41)
 exec vllm serve "$MODEL" --served-model-name "${SERVED_NAME:-deepseek-v4-flash}" --trust-remote-code \
   --tokenizer-mode deepseek_v41 --limit-mm-per-prompt '{"image":0}' --engram-config "$EG" \
   --kv-cache-dtype fp8 --max-model-len "${MAX_LEN:-8192}" \
   --kv-cache-memory-bytes $(( ${KV_GB:-4} * 1073741824 )) --gpu-memory-utilization "${GPU_UTIL:-0.97}" \
   --max-num-batched-tokens "${CHUNK:-4096}" --max-num-seqs "$NUM_SEQS" --no-scheduler-reserve-full-isl \
-  --default-chat-template-kwargs "$CT" \
+  --default-chat-template-kwargs "$CT" "${TP[@]}" \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":'"$CAP"'}' \
   ${SPEC_N:+--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_N}}"} \
   ${HOST:+--host "$HOST"} "${MW[@]}" --port "${PORT:-8000}" "$@"

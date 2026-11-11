@@ -46,8 +46,10 @@ tools/install_tandem.sh                  # venv at ~/.venvs/tandem (stock vllm==
 hf download ewhacc/DeepSeek-V4.1-Flash-1017-Tandem-VQ2 --local-dir ~/models/v41-tandem
 ```
 
-The installer leaves a launcher, `~/.venvs/tandem/bin/tandem-serve`. It takes `KEY=value` settings followed by
-any `vllm serve` options. A fresh install reproduces the reference same-token KL bit for bit.
+The installer writes the launcher `~/.venvs/tandem/bin/tandem-serve` and links it as `~/.local/bin/tandem-serve`,
+so `tandem-serve` works from any folder once `~/.local/bin` is on your PATH (Ubuntu adds it at login when the folder
+exists; otherwise `export PATH="$HOME/.local/bin:$PATH"`, or call the full path). It takes `KEY=value` settings
+followed by any `vllm serve` options. A fresh install reproduces the reference same-token KL bit for bit.
 
 ## Quick start
 
@@ -62,6 +64,10 @@ tandem-serve MODEL=~/models/v41-tandem BASE_GB=65.5
 # the drafter does not fit on 32 GB)
 tandem-serve MODEL=~/models/v41-tandem BASE_GB=10 RAM_GB=90 ENGRAM=files
 ```
+
+The server speaks the OpenAI API on port 8000 (served model name `deepseek-v4-flash`). Tool calling is on, and the
+thinking text comes back in its own `reasoning` field, so chat front ends such as Open WebUI show it separately.
+Image input is off in 0.1.0: the package holds the vision weights, but vision is not yet tested on Tandem.
 
 The first boot builds FlashInfer and CPU kernels (several minutes). Later boots take about 2–4 minutes; most of
 that is pinning the experts in RAM.
@@ -81,6 +87,7 @@ that is pinning the experts in RAM.
 | `RAM_GB=N` | pin only the N GiB of most-routed experts; read the rest from the package files |
 | `ENGRAM=files` | read Engram rows from the files instead of pinning 97 GiB of tables |
 | `THINKING=0/1`, `REASONING_EFFORT=low/high/max` | chat template defaults |
+| `TOOLS=1/0` | tool calling and the separate `reasoning` field (DeepSeek-V4.1 parsers; default on) |
 | `GPU=`, `PORT=`, `HOST=`, `ALLOW=cidr,...`, `PANEL=1` | device, network, client allowlist, status page at `/tandem/` |
 
 ## Measured (RTX PRO 6000 96 GB + EPYC 9534, DDR5-4800)
@@ -146,3 +153,4 @@ quality setting from VQ + FP4 top 52 up to all-FP4.
 - GPUs other than SM120; multi-GPU (TP) serving.
 - Models other than DeepSeek-V4.1-Flash (see [Models](#models)).
 - Original-precision experts on the CPU (see [Models](#models)).
+- Image input (vision weights are in the package; not yet tested).
