@@ -34,8 +34,7 @@ Also needed: 300 GB of disk for the package (NVMe), Linux x86-64, an NVIDIA driv
 
 GPUs other than SM120 (RTX 50xx, RTX PRO Blackwell) are not supported in 0.1.0. The kernels are SM120 SASS.
 16 GB cards do not fit: the non-expert weights plus one double-buffered prefill layer need about 19–20 GiB.
-On dual-channel desktop memory (DDR4, or DDR5 with two channels) every missed expert is streamed from RAM, so
-memory bandwidth, not PCIe, sets the decode speed.
+On a desktop CPU (two memory channels, fewer cores) the CPU's work on the missed experts sets the decode speed.
 
 For one user on a 16–32 GB card with 64–128 GB of RAM, use the sister project
 [tandem.cpp](https://github.com/ewhacc/tandem.cpp) (a llama.cpp patch set; DeepSeek-V4.1-Flash IQ2_XS at 33 tok/s on an
@@ -109,8 +108,8 @@ System decode tok/s, all streams active (512-token GSM8K answers, thinking high)
 - At 8+ streams the drafter does not help. Serve without it. With the drafter and `STEP_T=32` the card fits only
   BASE 60.
 - RTX 5090 32 GB + i5-14600KF, 128 GB DDR4-3200 (`BASE_GB=10 RAM_GB=90 ENGRAM=files`): 16 / 18 / 20 tok/s at
-  1 / 2 / 4 streams; one user with `BASE_GB=12 KV_GB=1 STEP_T=2`: 17 tok/s; a 32k-token prompt waits about 2 minutes. On dual-channel DDR4 every missed expert is
-  streamed from RAM, so memory bandwidth sets the speed.
+  1 / 2 / 4 streams; one user with `BASE_GB=12 KV_GB=1 STEP_T=2`: 17 tok/s; a 32k-token prompt waits about 2 minutes. There the CPU's work on the missed
+  experts sets the speed.
 
 Quality (thinking low, greedy). Reference: the original FP4 model on stock vLLM 0.32 (4× H200).
 
