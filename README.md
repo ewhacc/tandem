@@ -83,7 +83,7 @@ that is pinning the experts in RAM.
 | `STEP_T=` | largest decode step in tokens (streams × (1+k)). Default 32 without a drafter, 8 with one. |
 | `NUM_SEQS=` | concurrent streams; default `STEP_T/(1+k)` |
 | `CHUNK=` | prefill chunk in tokens (default 4096). 8192 prefills a 94k prompt in 46 s instead of 70 s but needs `BASE_GB` ≤ 60 on a 96 GB card. A too-large CHUNK + BASE pair boots, then runs out of memory on the first long prompt: lower `BASE_GB` by 5. |
-| `KV_GB=`, `MAX_LEN=` | KV cache size and context length (tested to 131072 with KV_GB=8) |
+| `KV_GB=`, `MAX_LEN=` | KV cache in GiB (default 4, about 140k tokens shared by all streams) and the per-request context length (default 32768; tested to 131072 with KV_GB=8). A longer `MAX_LEN` costs no VRAM. |
 | `RAM_GB=N` | pin only the N GiB of most-routed experts; read the rest from the package files |
 | `ENGRAM=files` | read Engram rows from the files instead of pinning 97 GiB of tables |
 | `THINKING=0/1`, `REASONING_EFFORT=low/high/max` | chat template defaults |

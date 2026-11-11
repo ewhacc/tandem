@@ -10,7 +10,9 @@
 #                         (0 = VQ only; any K <= 64; the FP4 pool size follows)
 #   BASE_GB=N             GPU cache for the VQ base (GiB; the rest of the card
 #                         after KV, FP4 pool and activations)
-#   GPU=0 PORT=8000 KV_GB=4 MAX_LEN=8192 NUM_SEQS=STEP_T/(1+k) CPU=1
+#   GPU=0 PORT=8000 KV_GB=4 MAX_LEN=32768 NUM_SEQS=STEP_T/(1+k) CPU=1
+#                         (MAX_LEN is the per-request limit; the KV_GB=4 cache holds about 140k tokens shared by all
+#                         streams, so it costs no VRAM. 32768 tested on the 5090 and the 96 GB card, 131072 with KV_GB=8)
 #   THINKING=1 REASONING_EFFORT=low|high|max   chat-template defaults
 #   TOOLS=1               OpenAI tool calling (--enable-auto-tool-choice, deepseek_v41 tool parser) and the
 #                         thinking text in its own reasoning field (deepseek_v41 reasoning parser); 0 = both off
@@ -99,7 +101,7 @@ TP=()
 [ "${TOOLS:-1}" = 1 ] && TP=(--enable-auto-tool-choice --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41)
 exec vllm serve "$MODEL" --served-model-name "${SERVED_NAME:-deepseek-v4-flash}" --trust-remote-code \
   --tokenizer-mode deepseek_v41 --limit-mm-per-prompt '{"image":0}' --engram-config "$EG" \
-  --kv-cache-dtype fp8 --max-model-len "${MAX_LEN:-8192}" \
+  --kv-cache-dtype fp8 --max-model-len "${MAX_LEN:-32768}" \
   --kv-cache-memory-bytes $(( ${KV_GB:-4} * 1073741824 )) --gpu-memory-utilization "${GPU_UTIL:-0.97}" \
   --max-num-batched-tokens "${CHUNK:-4096}" --max-num-seqs "$NUM_SEQS" --no-scheduler-reserve-full-isl \
   --default-chat-template-kwargs "$CT" "${TP[@]}" \
