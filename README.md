@@ -1,4 +1,4 @@
-# Tandem-vLLM 0.1.0
+# Tandem-vLLM 0.1.1
 
 Run DeepSeek-V4.1-Flash on one workstation GPU. The routed experts live in host RAM as
 2-bit VQ codes, a GPU cache holds the most-used ones, and missed experts are computed by the CPU in parallel
@@ -32,7 +32,7 @@ built for workstation and server-class machines:
 Also needed: 300 GB of disk for the package (NVMe), Linux x86-64, an NVIDIA driver with the CUDA 13.x toolkit
 (nvcc), Python 3.12 and g++.
 
-GPUs other than SM120 (RTX 50xx, RTX PRO Blackwell) are not supported in 0.1.0. The kernels are SM120 SASS.
+GPUs other than SM120 (RTX 50xx, RTX PRO Blackwell) are not supported in 0.1.1. The kernels are SM120 SASS.
 16 GB cards do not fit: the non-expert weights plus one double-buffered prefill layer need about 19–20 GiB.
 On a desktop CPU (two memory channels, fewer cores) the CPU's work on the missed experts sets the decode speed.
 
@@ -69,11 +69,15 @@ tandem-serve MODEL=~/models/v41-tandem BASE_GB=10 RAM_GB=90 ENGRAM=files
 
 # same box, one user: a 1 GiB KV cache (enough for one 32k conversation) leaves room for a larger expert cache
 tandem-serve MODEL=~/models/v41-tandem BASE_GB=12 KV_GB=1 STEP_T=2 RAM_GB=90 ENGRAM=files
+
+# same, with image input (the vision encoder takes 1 GiB of the expert cache)
+tandem-serve MODEL=~/models/v41-tandem BASE_GB=11 KV_GB=1 STEP_T=2 RAM_GB=90 ENGRAM=files IMAGES=1
 ```
 
 The server speaks the OpenAI API on port 8000 (served model name `deepseek-v4-flash`). Tool calling is on, and the
 thinking text comes back in its own `reasoning` field, so chat front ends such as Open WebUI show it separately.
-Image input is off in 0.1.0: the package holds the vision weights, but vision is not yet tested on Tandem.
+Image input is off by default; `IMAGES=1` turns it on (one image per prompt, OpenAI `image_url` content). The vision
+encoder adds about 1 GiB of VRAM at boot and 1.5 GiB at peak with a large image, so give `BASE_GB` 1–2 GiB less.
 
 The first boot builds FlashInfer and CPU kernels (several minutes). Later boots take about 2–4 minutes; most of
 that is pinning the experts in RAM.
@@ -94,6 +98,7 @@ that is pinning the experts in RAM.
 | `ENGRAM=files` | read Engram rows from the files instead of pinning 97 GiB of tables |
 | `THINKING=0/1`, `REASONING_EFFORT=low/high/max` | chat template defaults |
 | `TOOLS=1/0` | tool calling and the separate `reasoning` field (DeepSeek-V4.1 parsers; default on) |
+| `IMAGES=N` | image inputs per prompt (default 0: the vision encoder is not loaded). Costs 1–1.5 GiB of VRAM; lower `BASE_GB` to match (5090 one-user: 11 instead of 12). |
 | `GPU=`, `PORT=`, `HOST=`, `ALLOW=cidr,...`, `PANEL=1` | device, network, client allowlist, status page at `/tandem/` |
 
 ## Measured (RTX PRO 6000 96 GB + EPYC 9534, DDR5-4800)
@@ -109,7 +114,8 @@ System decode tok/s, all streams active (512-token GSM8K answers, thinking high)
   BASE 60.
 - RTX 5090 32 GB + i5-14600KF, 128 GB DDR4-3200 (`BASE_GB=10 RAM_GB=90 ENGRAM=files`): 16 / 18 / 20 tok/s at
   1 / 2 / 4 streams; one user with `BASE_GB=12 KV_GB=1 STEP_T=2`: 17 tok/s; a 32k-token prompt waits about 2 minutes. There the CPU's work on the missed
-  experts sets the speed.
+  experts sets the speed. With `IMAGES=1` and `BASE_GB=11`: a 2400×2400 image is read in 3–7 s to the first token; peak
+  VRAM 30.8 of 32 GB.
 
 Quality (thinking low, greedy). Reference: the original FP4 model on stock vLLM 0.32 (4× H200).
 
@@ -133,7 +139,7 @@ format refuses to boot with a message to upgrade. Engine and package versions ar
 
 ## Models
 
-| model | status in 0.1.0 |
+| model | status in 0.1.1 |
 |---|---|
 | DeepSeek-V4.1-Flash-1017, Tandem VQ2 package | supported (this release) |
 | DeepSeek-V4-Flash | runs on the engine with plain 2-bit experts; not packaged or validated |
@@ -155,8 +161,17 @@ quality setting from VQ + FP4 top 52 up to all-FP4.
   experts, DSpark drafter support with offloaded experts, the lite package format and its loader, huge-page pinned
   stores, and the port to vLLM 0.31 / DeepSeek-V4.1 (including SM120 attention fixes).
 
-## Not in 0.1.0
+## Changes since 0.1.0
+
+- Image input: `IMAGES=1` (vision encoder of the package; checked on reading text and tables from images).
+- Tool calling and the separate `reasoning` field on by default (`TOOLS=0` turns them off).
+- `MAX_LEN` default 32768 (was 8192); `STEP_T` 8 by default on cards under 48 GB.
+- CPU expert engine: no longer keeps cores busy while the server is idle; the work split adapts to mixed P/E-core
+  CPUs (+6% on an i5-14600KF), with unchanged outputs.
+- The installer links `tandem-serve` into `~/.local/bin`.
+- One-user lines for 32 GB cards in the quick start.
+
+## Not in 0.1.1
 - GPUs other than SM120; multi-GPU (TP) serving.
 - Models other than DeepSeek-V4.1-Flash (see [Models](#models)).
 - Original-precision experts on the CPU (see [Models](#models)).
-- Image input (vision weights are in the package; not yet tested).

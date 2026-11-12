@@ -17,6 +17,8 @@
 #   TOOLS=1               OpenAI tool calling (--enable-auto-tool-choice, deepseek_v41 tool parser) and the
 #                         thinking text in its own reasoning field (deepseek_v41 reasoning parser); 0 = both off
 #                         (PT1: tool calls, tool results, streaming, thinking on/off checked)
+#   IMAGES=N              image inputs per prompt (vision encoder on): +1.0 GiB of VRAM at boot, +1.5 GiB at
+#                         peak with a max-size image (VIS1/VIS2), so lower BASE_GB by 2; default 0 = encoder not loaded
 #   CUBIT_DIR=<dir>       SM120 kernel cubins (VLLM_MOE_W2_CUBIT_DIR)
 #   RAM_GB=N              small-RAM box: pin only the N GiB of most-routed VQ experts,
 #                         read the rest from the package files (VLLM_TANDEM_RAM_GB)
@@ -100,7 +102,7 @@ fi
 TP=()
 [ "${TOOLS:-1}" = 1 ] && TP=(--enable-auto-tool-choice --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41)
 exec vllm serve "$MODEL" --served-model-name "${SERVED_NAME:-deepseek-v4-flash}" --trust-remote-code \
-  --tokenizer-mode deepseek_v41 --limit-mm-per-prompt '{"image":0}' --engram-config "$EG" \
+  --tokenizer-mode deepseek_v41 --limit-mm-per-prompt "{\"image\":${IMAGES:-0}}" --engram-config "$EG" \
   --kv-cache-dtype fp8 --max-model-len "${MAX_LEN:-32768}" \
   --kv-cache-memory-bytes $(( ${KV_GB:-4} * 1073741824 )) --gpu-memory-utilization "${GPU_UTIL:-0.97}" \
   --max-num-batched-tokens "${CHUNK:-4096}" --max-num-seqs "$NUM_SEQS" --no-scheduler-reserve-full-isl \
