@@ -207,6 +207,10 @@ def _sparse_mla_dsv4_kernel(
     stride_oh,
     stride_it,
     extra_stride_it,
+    chunk_main,
+    chunk_extra,
+    part_ptr,
+    ml_ptr,
     HAS_EXTRA: tl.constexpr,
     HAS_SINK: tl.constexpr,
     HAS_LENS: tl.constexpr,
@@ -219,9 +223,15 @@ def _sparse_mla_dsv4_kernel(
     D_NOPE: tl.constexpr,
     QUANT_TILE: tl.constexpr,
     DOT_BF16: tl.constexpr,
+    NSPLIT: tl.constexpr,
 ):
+    # NSPLIT > 1 (split-KV, decode): program_id(2) takes index chunk sp of
+    # each segment ([sp * chunk, (sp + 1) * chunk)) and stores its
+    # unnormalized online-softmax state (acc, m, l) for
+    # _sparse_mla_dsv4_combine; the sink is applied there.
     t = tl.program_id(0)
     hb = tl.program_id(1)
+    sp = tl.program_id(2)
     h_offs = hb * BLOCK_H + tl.arange(0, BLOCK_H)
     h_ok = h_offs < H
     d_offs = tl.arange(0, D)
@@ -247,9 +257,11 @@ def _sparse_mla_dsv4_kernel(
         n_main = tl.maximum(tl.minimum(n_main, K_main), 0)
     else:
         n_main = K_main
-    for start in range(0, n_main, BLOCK_N):
+    lo_main = sp * chunk_main
+    hi_main = tl.minimum(n_main, lo_main + chunk_main)
+    for start in range(lo_main, hi_main, BLOCK_N):
         offs = start + tl.arange(0, BLOCK_N)
-        in_len = offs < n_main
+        in_len = offs < hi_main
         idx = tl.load(idx_ptr + t * stride_it + offs, mask=in_len, other=-1)
         valid = in_len & (idx >= 0)
         idx0 = tl.where(valid, idx, 0).to(tl.int64)
@@ -278,9 +290,11 @@ def _sparse_mla_dsv4_kernel(
             n_extra = tl.maximum(tl.minimum(n_extra, K_extra), 0)
         else:
             n_extra = K_extra
-        for start in range(0, n_extra, BLOCK_N):
+        lo_extra = sp * chunk_extra
+        hi_extra = tl.minimum(n_extra, lo_extra + chunk_extra)
+        for start in range(lo_extra, hi_extra, BLOCK_N):
             offs = start + tl.arange(0, BLOCK_N)
-            in_len = offs < n_extra
+            in_len = offs < hi_extra
             idx = tl.load(extra_idx_ptr + t * extra_stride_it + offs,
                           mask=in_len,
                           other=-1)
@@ -306,6 +320,14 @@ def _sparse_mla_dsv4_kernel(
                 acc = acc * alpha[:, None] + tl.dot(p, k, allow_tf32=True)
             m = m_new
 
+    if NSPLIT > 1:
+        prow = (t * H + h_offs) * NSPLIT + sp
+        tl.store(part_ptr + prow[:, None] * D + d_offs[None, :], acc,
+                 mask=h_ok[:, None])
+        tl.store(ml_ptr + prow * 2, m, mask=h_ok)
+        tl.store(ml_ptr + prow * 2 + 1, l, mask=h_ok)
+        return
+
     if HAS_SINK:
         # The sink is a virtual candidate with value 0: it adds softmax
         # mass to the denominator only (FlashMLA V4 semantics; padded
@@ -325,6 +347,85 @@ def _sparse_mla_dsv4_kernel(
         o.to(out_ptr.dtype.element_ty),
         mask=h_ok[:, None],
     )
+
+
+@triton.jit
+def _sparse_mla_dsv4_combine(
+    out_ptr,
+    part_ptr,
+    ml_ptr,
+    sink_ptr,
+    H,
+    stride_ot,
+    stride_oh,
+    HAS_SINK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    D: tl.constexpr,
+    NSPLIT: tl.constexpr,
+):
+    """Merge the NSPLIT partial softmax states of one (token, head block),
+    then the sink and the normalization of _sparse_mla_dsv4_kernel."""
+    t = tl.program_id(0)
+    hb = tl.program_id(1)
+    h_offs = hb * BLOCK_H + tl.arange(0, BLOCK_H)
+    h_ok = h_offs < H
+    d_offs = tl.arange(0, D)
+    base = (t * H + h_offs) * NSPLIT
+    m = tl.full([BLOCK_H], -1.0e30, tl.float32)
+    for sp in range(NSPLIT):
+        m = tl.maximum(m, tl.load(ml_ptr + (base + sp) * 2, mask=h_ok,
+                                  other=-1.0e30))
+    l = tl.zeros([BLOCK_H], tl.float32)
+    acc = tl.zeros([BLOCK_H, D], tl.float32)
+    for sp in range(NSPLIT):
+        ms = tl.load(ml_ptr + (base + sp) * 2, mask=h_ok, other=-1.0e30)
+        ls = tl.load(ml_ptr + (base + sp) * 2 + 1, mask=h_ok, other=0.0)
+        a = tl.exp2(ms - m)
+        l += ls * a
+        acc += tl.load(part_ptr + (base + sp)[:, None] * D + d_offs[None, :],
+                       mask=h_ok[:, None], other=0.0) * a[:, None]
+    if HAS_SINK:
+        snk = tl.load(sink_ptr + h_offs, mask=h_ok, other=-1.0e30)
+        snk = tl.maximum(snk * 1.4426950408889634, -1.0e30)
+        m_new = tl.maximum(m, snk)
+        alpha = tl.exp2(m - m_new)
+        l = l * alpha + tl.exp2(snk - m_new)
+        acc = acc * alpha[:, None]
+    l_safe = tl.where(l > 0.0, l, 1.0)
+    o = acc / l_safe[:, None]
+    tl.store(
+        out_ptr + t * stride_ot + h_offs[:, None] * stride_oh + d_offs[None, :],
+        o.to(out_ptr.dtype.element_ty),
+        mask=h_ok[:, None],
+    )
+
+
+# Split-KV for small decode grids: the plain grid is (tokens, heads / 16),
+# 4 programs per token at 64 heads -- a few % of the SMs (rome A6000 PROF2:
+# 371 us per layer, 26% of the decode step). VLLM_DSV4_MLA_SPLIT=N forces N
+# splits (1 = off); default: enough splits for ~2 programs per SM, at most
+# 16 and at least one BLOCK_N chunk each.
+_MLA_SPLIT_ENV = int(os.getenv("VLLM_DSV4_MLA_SPLIT", "0") or 0)
+_split_override: int | None = None   # self-test hook
+
+
+@functools.cache
+def _num_sms(dev_index: int) -> int:
+    return torch.cuda.get_device_properties(dev_index).multi_processor_count
+
+
+def _pick_split(num_tokens: int, hblocks: int, k_total: int, block_n: int,
+                device: torch.device) -> int:
+    if _split_override is not None:
+        return _split_override
+    if _MLA_SPLIT_ENV > 0:
+        return _MLA_SPLIT_ENV
+    if device.type != "cuda" or _IS_INTERPRET:
+        return 1
+    progs = max(1, num_tokens * hblocks)
+    want = (2 * _num_sms(device.index if device.index is not None else
+                         torch.cuda.current_device()) + progs - 1) // progs
+    return max(1, min(16, want, max(1, k_total // block_n)))
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +811,25 @@ def triton_sparse_mla_dsv4(
     )
 
     block_h = 16
-    grid = (num_tokens, triton.cdiv(num_heads, block_h))
+    block_n = 16 if _MLA_DOT_FP32 else 32
+    hblocks = triton.cdiv(num_heads, block_h)
+    k_main = idx_main.shape[-1]
+    k_extra = idx_extra.shape[-1] if has_extra else 0
+    nsplit = _pick_split(num_tokens, hblocks, max(k_main, k_extra), block_n,
+                         query_flat.device)
+
+    def _chunk(k):
+        return max(block_n, triton.cdiv(triton.cdiv(max(k, 1), nsplit),
+                                        block_n) * block_n)
+
+    if nsplit > 1:
+        part = torch.empty((num_tokens * num_heads * nsplit, _D),
+                           dtype=torch.float32, device=query_flat.device)
+        ml = torch.empty((num_tokens * num_heads * nsplit, 2),
+                         dtype=torch.float32, device=query_flat.device)
+    else:
+        part = ml = query_flat
+    grid = (num_tokens, hblocks, nsplit)
     if num_tokens > 0:
         _sparse_mla_dsv4_kernel[grid](
             query_flat,
@@ -736,6 +855,10 @@ def triton_sparse_mla_dsv4(
             out_flat.stride(1),
             idx_main.stride(0),
             idx_extra.stride(0),
+            _chunk(k_main) if nsplit > 1 else max(k_main, 1),
+            _chunk(k_extra) if nsplit > 1 else max(k_extra, 1),
+            part,
+            ml,
             HAS_EXTRA=has_extra,
             HAS_SINK=sinks is not None,
             HAS_LENS=lens_main is not None,
@@ -745,7 +868,7 @@ def triton_sparse_mla_dsv4(
             BLOCK_H=block_h,
             # f32 operand tiles measured 295 KiB via AOT compile, over Ada's
             # 99 KiB smem at BLOCK_N=32 -- the fp32 dot path only fits at 16.
-            BLOCK_N=16 if _MLA_DOT_FP32 else 32,
+            BLOCK_N=block_n,
             D=_D,
             D_NOPE=_D_NOPE,
             QUANT_TILE=_QUANT_TILE,
@@ -755,9 +878,25 @@ def triton_sparse_mla_dsv4(
             # opts into the f32/tf32 dot with the BLOCK_N=16 tile above. The
             # init-time self-test validates whichever path is shipped.
             DOT_BF16=not _IS_INTERPRET and not _MLA_DOT_FP32,
+            NSPLIT=nsplit,
             num_warps=4,
             num_stages=1,
         )
+        if nsplit > 1:
+            _sparse_mla_dsv4_combine[(num_tokens, hblocks)](
+                out_flat,
+                part,
+                ml,
+                sinks if sinks is not None else query_flat,
+                num_heads,
+                out_flat.stride(0),
+                out_flat.stride(1),
+                HAS_SINK=sinks is not None,
+                BLOCK_H=block_h,
+                D=_D,
+                NSPLIT=nsplit,
+                num_warps=4,
+            )
     if _IO_TRACE_PATH:
         _io_trace(query_flat, kv_main, pbs_main, idx_main, lens_main,
                   kv_extra if has_extra else None, pbs_extra,
@@ -920,9 +1059,18 @@ def _self_test_case(device: torch.device) -> float:
         sinks=sinks,
         kv_layout="NHD",
     )
-    got = triton_sparse_mla_dsv4(**kwargs)
     want = sparse_mla_dsv4_torch_ref(**kwargs)
-    return _worst_row_rel(got, want)
+    global _split_override
+    worst = 0.0
+    # plain grid, and split-KV (3 splits: uneven chunks, empty tails)
+    for ns in (1, 3):
+        _split_override = ns
+        try:
+            got = triton_sparse_mla_dsv4(**kwargs)
+        finally:
+            _split_override = None
+        worst = max(worst, _worst_row_rel(got, want))
+    return worst
 
 
 def _worst_row_rel(got: torch.Tensor, want: torch.Tensor) -> float:

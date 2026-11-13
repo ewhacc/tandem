@@ -207,11 +207,18 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
             "Use FLASHINFER_MLA_SPARSE_DSV41 for DeepSeek V4.1 FlashInfer "
             "sparse MLA."
         )
+    # pre-SM90 (Ada, Ampere): FlashMLA, FlashInfer and mega attention have no
+    # DSv4 sparse kernels; the SM120-layout class runs there through vLLM's
+    # Triton sparse-MLA port (vllm/utils/flashinfer.py routes by arch), as
+    # for DeepSeek V4
+    pre_sm90 = device_capability is not None and device_capability.major < 9
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV41,
     ):
-        if device_capability is not None and device_capability.major == 12:
+        if device_capability is not None and (
+            device_capability.major == 12 or pre_sm90
+        ):
             return DeepseekV4FlashInferSM120Attention
         return DeepseekV4FlashInferMLAAttention
     if backend is AttentionBackendEnum.FLASHMLA_MEGA_ATTN_DSV41:
@@ -223,7 +230,7 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     ):
         return DeepseekV4FlashMLAAttention
 
-    if device_capability is not None and device_capability.major == 12:
+    if device_capability is not None and (device_capability.major == 12 or pre_sm90):
         return DeepseekV4FlashInferSM120Attention
     # Mega attention is the SM100 default: it fuses Q RoPE, sparse attention,
     # the output's inverse RoPE and its FP8 cast into one launch, and brings

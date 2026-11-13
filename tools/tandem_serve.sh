@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Serve a Tandem lite package (DeepSeek-V4.1-Flash, VQ experts) on one GPU.
+# Serve a Tandem lite package (DeepSeek-V4.1-Flash, VQ experts) on one GPU, or on 2/4/8 (GPU=0,1).
 # The package's config.json "tandem" block sets the expert stores (planes,
 # VQ table, FP4 hot set; vllm tandem_pkg.py); this script sets the runtime:
 # host-resident VQ base behind a GPU cache, misses read in-GEMM from pinned
@@ -10,6 +10,21 @@
 #                         (0 = VQ only; any K <= 64; the FP4 pool size follows)
 #   BASE_GB=N             GPU cache for the VQ base (GiB; the rest of the card
 #                         after KV, FP4 pool and activations)
+#   GPU=0,1               several GPUs (2, 4 or 8): vLLM tensor parallel for attention, Engram and the shared
+#                         experts; each GPU owns whole routed experts (VLLM_MOE_W2_EP). BASE_GB and KV_GB are
+#                         per GPU, RAM_GB is the total (split over the GPUs). ET1: 2x PRO 6000 +18% vs one GPU;
+#                         an 8-core CPU is too small for two (rome RB5: slower than one GPU)
+#   HELPER_GPU=1 HELPER_GB=40
+#                         one main GPU (GPU=) + a helper GPU that holds a fixed warm slice of the ranked experts
+#                         (HELPER_GB GiB after the main cache's share) and computes the main GPU's misses on them
+#                         next to the CPU; the CPU keeps the rest. For hosts whose CPU is too small for TP
+#                         (VLLM_MOE_W2_CPU_HELPER, VLLM_MOE_W2_HELPER_GB). HELPER_SPLIT=alt: the helper owns every
+#                         other expert of the top ranks instead and computes all routes to them; the main GPU
+#                         caches only the rest (the two GPUs split the hot set evenly). HELPER_SPLIT=dyn: that
+#                         layout as the start, then the helper caches the hottest experts the main GPU does not
+#                         serve (loaded from RAM over its own link; exclusive with the main GPU). dyn is the default
+#                         (rome RH5/RH6: +9%/+11% vs alt; 24 GB cards: HELPER_GB=22 fits, +30% vs one card); set
+#                         HELPER_SPLIT=slice for the fixed slice. No GPU P2P needed (data goes through pinned RAM)
 #   GPU=0 PORT=8000 KV_GB=4 MAX_LEN=32768 NUM_SEQS=STEP_T/(1+k) CPU=1
 #                         (MAX_LEN is the per-request limit; the KV_GB=4 cache holds about 140k tokens shared by all
 #                         streams, so it costs no VRAM. 32768 tested on the 5090 and the 96 GB card, 131072 with KV_GB=8)
@@ -48,13 +63,26 @@ MODEL=${MODEL:?set MODEL=<Tandem package dir>}
 VENV=${VENV:-$HOME/.venvs/tandem}
 export PATH="$VENV/bin:$PATH"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=${GPU:-0}
+if [ -n "${HELPER_GPU:-}" ]; then
+  case "${GPU:-0}" in *,*) echo "HELPER_GPU needs one main GPU (GPU=${GPU})" >&2; exit 2 ;; esac
+  export CUDA_VISIBLE_DEVICES=${GPU:-0},$HELPER_GPU VLLM_MOE_W2_CPU_HELPER=1
+  export VLLM_MOE_W2_HELPER_GB=${HELPER_GB:-20} VLLM_MOE_W2_HELPER_SPLIT=${HELPER_SPLIT:-dyn}
+fi
 
 # expert stores: from the package (engine side); FP4 count
 export VLLM_TANDEM_FP4_TOP=${FP4_TOP:-0}
 [ "$VLLM_TANDEM_FP4_TOP" -gt 0 ] && export VLLM_MOE_W2_PREFILL_FP4=1   # prefill reads the FP4 tier too
 export VLLM_MOE_W2_CUBIT_DIR=${CUBIT_DIR:-${VLLM_MOE_W2_CUBIT_DIR:-$(cd "$(dirname "$0")" && pwd)/cubins}}
 export VLLM_MOE_W2_KS=7168,6144,5120,4096,2304,2048,1152,1024,512
-[ -n "${RAM_GB:-}" ] && export VLLM_TANDEM_RAM_GB=$RAM_GB
+# several GPUs: tensor parallel, whole experts per GPU; RAM_GB is shared out per GPU process
+NGPU=$(echo "${GPU:-0}" | tr ',' '\n' | grep -c .)
+PAR=()
+if [ "$NGPU" -gt 1 ]; then
+  case $NGPU in 2|4|8) ;; *) echo "GPU=${GPU}: use 1, 2, 4 or 8 GPUs" >&2; exit 2 ;; esac
+  export VLLM_MOE_W2_EP=1
+  PAR=(--tensor-parallel-size "$NGPU")
+fi
+[ -n "${RAM_GB:-}" ] && export VLLM_TANDEM_RAM_GB=$(awk "BEGIN{print ${RAM_GB} / ${NGPU}}")
 EG='{"use_thp":true}'
 [ "${ENGRAM:-ram}" = files ] && export VLLM_TANDEM_ENGRAM_FILES=1 && EG='{"cpu_offload":true}'
 
@@ -68,6 +96,9 @@ export VLLM_MOE_W2_REPLAY_MODE=strict VLLM_MOE_W2_BASE_MISS_TOL=0
 # the expert cache (pcbox1 5090: warm-up OOM at BASE 10), so cards under 48 GB default to 8 (up to 8 streams)
 GPU_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i "${GPU:-0}" 2>/dev/null | head -1 || true)
 STEP_T=${STEP_T:-$([ -n "${SPEC_N:-}" ] || [ "${GPU_MIB:-99999}" -lt 49152 ] && echo 8 || echo 32)}
+# SM89 (Ada): vLLM ranks Marlin weight-only FP8 first there; it repacks wo_a and breaks the o_proj bmm (RB2)
+GPU_CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i "${GPU:-0}" 2>/dev/null | head -1 || true)
+[ "$GPU_CC" = 8.9 ] && export VLLM_DISABLED_KERNELS=${VLLM_DISABLED_KERNELS:-MarlinFP8ScaledMMLinearKernel,HummingFP8ScaledMMLinearKernel}
 export VLLM_MOE_W2_PREFILL_T=$STEP_T VLLM_MOE_W2_GATE=0
 export VLLM_MOE_W2_STABLE_TOPK=1 VLLM_MOE_W2_ZERO_NULL_BLOCK=1
 export VLLM_USE_V2_MODEL_RUNNER=1 VLLM_USE_BREAKABLE_CUDAGRAPH=0
@@ -99,14 +130,14 @@ if [ "${THINKING:-1}" = 1 ]; then
 else
   CT='{"thinking":false}'
 fi
-TP=()
-[ "${TOOLS:-1}" = 1 ] && TP=(--enable-auto-tool-choice --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41)
+TOOL_ARGS=()
+[ "${TOOLS:-1}" = 1 ] && TOOL_ARGS=(--enable-auto-tool-choice --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41)
 exec vllm serve "$MODEL" --served-model-name "${SERVED_NAME:-deepseek-v4-flash}" --trust-remote-code \
   --tokenizer-mode deepseek_v41 --limit-mm-per-prompt "{\"image\":${IMAGES:-0}}" --engram-config "$EG" \
   --kv-cache-dtype fp8 --max-model-len "${MAX_LEN:-32768}" \
   --kv-cache-memory-bytes $(( ${KV_GB:-4} * 1073741824 )) --gpu-memory-utilization "${GPU_UTIL:-0.97}" \
   --max-num-batched-tokens "${CHUNK:-4096}" --max-num-seqs "$NUM_SEQS" --no-scheduler-reserve-full-isl \
-  --default-chat-template-kwargs "$CT" "${TP[@]}" \
+  --default-chat-template-kwargs "$CT" "${TOOL_ARGS[@]}" "${PAR[@]}" \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":'"$CAP"'}' \
   ${SPEC_N:+--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_N}}"} \
   ${HOST:+--host "$HOST"} "${MW[@]}" --port "${PORT:-8000}" "$@"

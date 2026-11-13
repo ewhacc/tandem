@@ -39,6 +39,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils import moe_w2_anchor
 from vllm.model_executor.layers.quantization.utils import moe_w2_shadow
+from vllm.model_executor.layers.quantization.utils import moe_w2_ep
 from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
     mxfp4_to_codes,
     pack_fragment_major,
@@ -555,6 +556,7 @@ def _install_vq(ks) -> None:
     P = raw.size // 8
     _vq_table = torch.from_numpy(raw).view(P, 8).to("cuda")
     vfns = moe_w2_vq.make_launchers([k for k in ks if k % 256 == 0], P)
+    vworst = moe_w2_vq.self_test(vfns, P)
     for (tier, K), fn in vfns.items():
         _fns[("w2" if tier == "vq" else "w2mc4", K)] = (
             lambda desc, n_rows, pairs, stream, f=fn:
@@ -563,7 +565,10 @@ def _install_vq(ks) -> None:
         del _fns[key]
     _afrag_ok = False
     logger.info("moe_w2_cubit: VQ planes (%d patterns, %s): w2/w2mc4 served "
-                "by moe_w2_vq for K=%s", P, os.environ["VLLM_MOE_W2_VQ"],
+                "by moe_w2_vq (%s dot, parity worst rel %.2e) for K=%s", P,
+                os.environ["VLLM_MOE_W2_VQ"],
+                next(iter(vfns.values())).dot if vfns else "-",
+                max(vworst.values()) if vworst else float("nan"),
                 sorted(K for t, K in vfns if t == "vq"))
 
 
@@ -1133,6 +1138,11 @@ def plan_pack_skip(layer) -> bool:
     # block-quant checkpoints store full-width e4m3 rows.
     _mult = 1 if layer.w13_weight.dtype == torch.float8_e4m3fn else 2
     K13, K2 = K13h * _mult, K2h * _mult
+    from vllm.model_executor.layers.quantization.utils import moe_w2_ep
+    if moe_w2_ep.active():
+        # whole experts per rank (moe_w2_ep): full intermediate size
+        _w = moe_w2_ep.ids()[0]
+        N13, K2 = N13 * _w, K2 * _w
     c13len, s13len = N13 * K13 // 4, _base_sc_len(N13, K13)
     c2len, s2len = N2 * K2 // 4, _base_sc_len(N2, K2)
     if _EXL3_BASE:
@@ -2811,16 +2821,21 @@ def _deterministic_unpermute_kernel(
     # [T*top_k,H] FP32 scatter buffer used by index_copy_ + sum.
     for j in tl.static_range(0, TOP_K):
         route = token * TOP_K + j
-        slot = tl.load(inverse_ptr + route)
-        value = tl.load(
-            c2_ptr + slot * c2_stride + h, mask=h_mask, other=0.0
-        ).to(tl.float32)
         weight = tl.load(
             weights_ptr + token * weight_stride_t + j * weight_stride_k
         ).to(tl.float32)
+        # weight-0 routes may have no slot (moe_w2_ep drops other ranks'
+        # experts from the permutation): never read their inverse entry;
+        # their product is 0 either way
+        live = weight != 0.0
+        slot = tl.load(inverse_ptr + route, mask=live, other=0)
+        value = tl.load(
+            c2_ptr + slot * c2_stride + h, mask=h_mask & live, other=0.0
+        ).to(tl.float32)
         if HAS_ROW_MASK:
             weight = _fp32_mul_rn(
-                weight, tl.load(row_mask_ptr + slot).to(tl.float32))
+                weight, tl.load(row_mask_ptr + slot, mask=live,
+                                other=0).to(tl.float32))
         product = _fp32_mul_rn(value, weight)
         acc = _fp32_add_rn(acc, product)
     tl.store(out_ptr + token * out_stride + h, acc, mask=h_mask)
@@ -4583,8 +4598,36 @@ def _moe_w2_forward_timed(
     # prefill path (and the ensure guarantee) — see _PREFILL_T.
     prefill = T > _PREFILL_T
     mblock = 16 if prefill else _BLOCK
-    sorted_ids, expert_blocks, num_post = moe_align_block_size(
-        topk_ids, mblock, st["E"])
+    hsplit = False
+    if not prefill and st.get("base", False):
+        from vllm.model_executor.layers.quantization.utils import (
+            moe_w2_cpu, moe_w2_helper)
+        hsplit = moe_w2_cpu.helper_split(layer_key, T)
+    if hsplit:
+        full_ids, full_w = topk_ids, topk_weights
+    if moe_w2_ep.active():
+        # own experts only: other ranks' routes are dropped from the GEMMs
+        # (expert_map -1) and carry weight 0; the ids that feed seen /
+        # fetch / CPU paths point those routes at a hot own expert
+        topk_weights, ep_ids, ep_map = moe_w2_ep.remap(
+            layer_key, topk_weights, topk_ids, st["E"])
+        sorted_ids, expert_blocks, num_post = moe_align_block_size(
+            topk_ids, mblock, st["E"], expert_map=ep_map,
+            ignore_invalid_experts=True)
+        topk_ids = ep_ids
+    elif hsplit:
+        # helper alt split: the helper's experts leave the main GPU's GEMMs,
+        # seen marks and fetches; moe_w2_cpu.request gets the full routing
+        h_own, h_fb = moe_w2_cpu.helper_own(layer_key)
+        topk_weights, h_ids, h_map = moe_w2_helper.remap(
+            h_own, h_fb, topk_weights, topk_ids)
+        sorted_ids, expert_blocks, num_post = moe_align_block_size(
+            topk_ids, mblock, st["E"], expert_map=h_map,
+            ignore_invalid_experts=True)
+        topk_ids = h_ids
+    else:
+        sorted_ids, expert_blocks, num_post = moe_align_block_size(
+            topk_ids, mblock, st["E"])
     slots = sorted_ids.numel()
     pairs = slots // mblock
     # st["K2"] = per-rank expert intermediate I (w2 contraction), st["K13"] =
@@ -4717,8 +4760,10 @@ def _moe_w2_forward_timed(
         if not prefill and not (use_fp4 and moe_w2_delta.split_enabled()):
             from vllm.model_executor.layers.quantization.utils import (
                 moe_w2_cpu)
-            cpu_on = moe_w2_cpu.request(layer_key, x, topk_ids, topk_weights,
-                                        btier, tier if use_fp4 else None)
+            cpu_on = moe_w2_cpu.request(
+                layer_key, x, full_ids if hsplit else topk_ids,
+                full_w if hsplit else topk_weights,
+                btier, tier if use_fp4 else None)
         # DIRECT miss path: the plain base-cache builder and the non-split
         # base+FP4 decode builder have it. With the CPU path the misses are
         # zeroed here (m=0, masked weight) and added by moe_w2_cpu.join;

@@ -887,6 +887,9 @@ class Worker(WorkerBase):
         if not self.model_config.enforce_eager:
             with self._get_cudagraph_capture_context():
                 cuda_graph_memory_bytes = self.model_runner.capture_model()
+        # moe_w2 background threads may issue CUDA work from here on
+        from vllm.model_executor.layers.quantization.utils import moe_w2_cpu
+        moe_w2_cpu.mark_serving()
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (

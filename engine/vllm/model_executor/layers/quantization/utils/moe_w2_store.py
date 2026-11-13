@@ -1030,16 +1030,18 @@ class PlanesFileStore:
                     continue
                 li, _rk, ei, c = ln.split()[:4]
                 cnt[(int(li), int(ei))] = int(c)
+        from vllm.model_executor.layers.quantization.utils import moe_w2_ep
+        own = [ei for ei in range(n_experts) if moe_w2_ep.local(ei)]
         pairs = sorted(((cnt.get((li, ei), 0), li, ei)
-                        for li in range(n_layers) for ei in range(n_experts)),
+                        for li in range(n_layers) for ei in own),
                        key=lambda t: (-t[0], t[1], t[2]))
         ranked = {li for li, _ei in cnt}
         hot: dict[int, set[int]] = {li: set() for li in range(n_layers)}
-        frac = min(1.0, self.n_hot / max(len(ranked) * n_experts, 1))
+        frac = min(1.0, self.n_hot / max(len(ranked) * len(own), 1))
         for li in range(n_layers):
             if li not in ranked:
                 # unranked (the MTP layer): the global hot fraction by id
-                hot[li] = set(range(max(1, round(frac * n_experts))))
+                hot[li] = set(own[:max(1, round(frac * len(own)))])
         budget = self.n_hot - sum(len(h) for h in hot.values())
         for _c, li, ei in pairs:
             if budget <= 0:
@@ -1049,8 +1051,7 @@ class PlanesFileStore:
                 budget -= 1
         for li in range(n_layers):
             if not hot[li]:
-                hot[li].add(max(range(n_experts),
-                                key=lambda e: cnt.get((li, e), 0)))
+                hot[li].add(max(own, key=lambda e: cnt.get((li, e), 0)))
         return hot
 
     def __contains__(self, layer_key: int) -> bool:

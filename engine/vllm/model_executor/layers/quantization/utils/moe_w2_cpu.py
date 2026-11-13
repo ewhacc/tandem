@@ -63,8 +63,11 @@ _SPLIT = _PCIE > 0 or _FRAC > 0
 @triton.jit
 def _req_kernel(x_ptr, ids_ptr, w_ptr, slot_row_ptr, fslot_row_ptr, cpu_row_ptr,
                 hx_addr, hids_addr, hw_addr, hmsk_addr, H, T, top_k, n_experts,
-                n_pcie, fracq, rmap_ptr, HAS_F: tl.constexpr, SPLIT: tl.constexpr,
-                ROWMAP: tl.constexpr,
+                n_pcie, fracq, rmap_ptr, hown_ptr, hmsk_h_addr, hhdr_h_addr,
+                hcnt_ptr,
+                HAS_F: tl.constexpr, SPLIT: tl.constexpr,
+                ROWMAP: tl.constexpr, HELP: tl.constexpr, HALL: tl.constexpr,
+                CNT: tl.constexpr,
                 KCAP: tl.constexpr, R: tl.constexpr, EP: tl.constexpr,
                 BLOCK: tl.constexpr):
     """grid (T, cdiv(H, BLOCK)): copy x row t into the layer's pinned
@@ -73,7 +76,12 @@ def _req_kernel(x_ptr, ids_ptr, w_ptr, slot_row_ptr, fslot_row_ptr, cpu_row_ptr,
     most tokens stay on the DIRECT path, min(n_pcie, round(fracq / 65536 x
     missed routes)) of them; the CPU's experts are flagged in cpu_row for
     the descriptor build. ROWMAP (planes files): only pinned experts
-    (rmap_ptr[e] >= 0) can go over the link; cold ones stay on the CPU."""
+    (rmap_ptr[e] >= 0) can go over the link; cold ones stay on the CPU.
+    HELP (helper warm set): missed routes to the helper's experts
+    (hown_ptr[e] != 0) go to the helper's mask instead, before the split;
+    HALL (alt split): every route to a helper expert, resident or not.
+    CNT (dynamic helper): hcnt_ptr[e] += routes the main GPU does not
+    serve (helper's and CPU's), the helper cache's hotness signal."""
     t = tl.program_id(0)
     hb = tl.program_id(1)
     h = hb * BLOCK + tl.arange(0, BLOCK)
@@ -93,6 +101,17 @@ def _req_kernel(x_ptr, ids_ptr, w_ptr, slot_row_ptr, fslot_row_ptr, cpu_row_ptr,
         if HAS_F:
             res = res | (tl.load(fslot_row_ptr + e, mask=v, other=0) >= 0)
         miss = v & (res == 0)
+        if HELP:
+            hm = (v if HALL else miss) & (tl.load(hown_ptr + e, mask=v, other=0) != 0)
+            miss = miss & ~hm
+            hmh = hmsk_h_addr.to(tl.pointer_type(tl.int32))
+            tl.store(hmh + r, hm.to(tl.int32))
+            # helper route count -> its header word 3 (0: no job, no ring)
+            hhd = hhdr_h_addr.to(tl.pointer_type(tl.int32))
+            tl.store(hhd + 3, tl.sum(hm.to(tl.int32), axis=0))
+            if CNT:
+                tl.atomic_add(hcnt_ptr + e, tl.full((R,), 1, tl.int32),
+                              mask=miss | hm)
         if SPLIT:
             # tokens per missed expert; rank distinct experts by
             # (count desc, id asc); the first n_pcie stay DIRECT
@@ -113,7 +132,11 @@ def _req_kernel(x_ptr, ids_ptr, w_ptr, slot_row_ptr, fslot_row_ptr, cpu_row_ptr,
             ex = tl.arange(0, EP)
             tl.store(cpu_row_ptr + ex, tl.zeros((EP,), tl.int32), mask=ex < n_experts)
             tl.debug_barrier()
-            tl.store(cpu_row_ptr + e, tl.full((R,), 1, tl.int32), mask=cpu)
+            if HELP:
+                # the main GPU skips the helper's routes like the CPU's
+                tl.store(cpu_row_ptr + e, tl.full((R,), 1, tl.int32), mask=cpu | hm)
+            else:
+                tl.store(cpu_row_ptr + e, tl.full((R,), 1, tl.int32), mask=cpu)
         else:
             cpu = miss
         hi = hids_addr.to(tl.pointer_type(tl.int32))
@@ -135,6 +158,36 @@ def _ring_kernel(seq_ptr, bump, hdr_addr, glob_addr, key, T):
                                   [s], dtype=tl.int32, is_pure=False, pack=1)
     g = glob_addr.to(tl.pointer_type(tl.int64))
     tl.store(g, s.to(tl.int64) * 128 + key)
+
+
+@triton.jit
+def _gring_kernel(seq_ptr, hdr_addr, glob_addr, key, T):
+    """Helper doorbell (after _ring_kernel, same seq): with no helper
+    routes (header word 3 == 0) ack directly instead of ringing."""
+    s = tl.load(seq_ptr)
+    hd = hdr_addr.to(tl.pointer_type(tl.int32))
+    tl.store(hd + 2, T)
+    n = tl.load(hd + 3, volatile=True)
+    s = tl.inline_asm_elementwise("fence.sc.sys;\n\tmov.b32 $0, $1;", "=r,r",
+                                  [s], dtype=tl.int32, is_pure=False, pack=1)
+    if n == 0:
+        tl.store(hd + 1, s)
+    else:
+        g = glob_addr.to(tl.pointer_type(tl.int64))
+        tl.store(g, s.to(tl.int64) * 128 + key)
+
+
+@triton.jit
+def _add_if_kernel(out_ptr, hy_addr, hdr_addr, H, BLOCK: tl.constexpr):
+    """_add_kernel when the helper had routes (header word 3 != 0)."""
+    t = tl.program_id(0)
+    h = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    n = tl.load(hdr_addr.to(tl.pointer_type(tl.int32)) + 3, volatile=True)
+    m = (h < H) & (n != 0)
+    hy = hy_addr.to(tl.pointer_type(tl.float32))
+    o = tl.load(out_ptr + t * H + h, mask=m).to(tl.float32)
+    o += tl.load(hy + t * H + h, mask=m, volatile=True)
+    tl.store(out_ptr + t * H + h, o.to(out_ptr.dtype.element_ty), mask=m)
 
 
 @triton.jit
@@ -206,6 +259,18 @@ class _S:
     hhdr = hids = hseq = None  # cold-read hints (moe_w2_looka COLD_HINT)
     E = 0
     err = None                # [1] i32 device: ack timeouts
+    # helper warm set next to the CPU engine (moe_w2_helper warm_sets)
+    g_eng = None
+    g_hdr = g_glob = g_msk = g_y = None
+    g_own = None              # [n_keys, E] i32 pinned host: helper-held experts
+    g_snap = None             # [n_keys, E] i32 device: per-call copy of g_own
+    g_fb = None               # [n_keys] i32 device: fallback main expert
+    g_cnt = None              # [n_keys, E] i32 device: non-main routes (dyn)
+    g_dyn = None              # _DynHelper
+    serving = False           # vLLM's graph capture is over
+    g_wait = None
+    g_split = False           # alt split: the helper owns half the hot set
+    helper = None
 
 
 def on() -> bool:
@@ -349,8 +414,10 @@ def arm(btier) -> None:
         # 7F32 (rome, GSM8K c8) 7 threads beat 4 by 29%; on a 64-core
         # Genoa 60 beat 48
         pc = _physical_cores()
+        from vllm.model_executor.layers.quantization.utils import moe_w2_ep
         thr = int(os.getenv("VLLM_MOE_W2_CPU_THREADS",
-                            str(max(1, pc - max(1, min(4, pc // 16))))))
+                            str(max(1, (pc - max(1, min(4, pc // 16)))
+                                    // moe_w2_ep.ids()[0]))))
         _S.lib = _build()
         hp = (ctypes.c_uint64 * n)(*host)
         # VLLM_MOE_W2_CPU_PIN=1: one engine thread per physical core, from
@@ -362,10 +429,11 @@ def arm(btier) -> None:
         cp = (ctypes.c_int * thr)(*pin)
         from vllm.model_executor.layers.quantization.utils import moe_w2_helper
         vq = moe_w2_cubit.vq_enabled()
-        if vq and moe_w2_helper.enabled():
+        hybrid = moe_w2_helper.enabled() and moe_w2_helper.warm_gb() > 0
+        if vq and moe_w2_helper.enabled() and not hybrid:
             raise RuntimeError("VLLM_MOE_W2_VQ: the helper GPU cannot decode "
                                "vector codes; use the CPU experts")
-        if moe_w2_helper.enabled():
+        if moe_w2_helper.enabled() and not hybrid:
             hlp = moe_w2_helper.Helper(
                 _S, host, int(btier.slot_bytes), st["off_s13"], st["off_c2"],
                 st["off_s2"], H, I, int(st["E"]), _KCAP, _TCAP,
@@ -416,6 +484,8 @@ def arm(btier) -> None:
                 _S.eng = None
                 raise RuntimeError(f"VLLM_MOE_W2_VQ: CPU engine refused the "
                                    f"table (rc {rc}, H={H} I={I})")
+        if hybrid:
+            _arm_helper(btier, keys, st, H, I, lim, vq)
         _S.armed = True
         logger.info("moe_w2 CPU experts armed (%s%s): %d layers, %d threads, "
                     "H=%d I=%d, swiglu limit %s, PCIe share: up to %d "
@@ -439,6 +509,73 @@ def arm(btier) -> None:
         logger.warning("moe_w2 CPU experts disabled: %s", e)
 
 
+def _arm_helper(btier, keys, st, H, I, lim, vq) -> None:
+    """Warm-set helper GPU next to the CPU engine: its own pinned mask, y
+    and doorbell; x / ids / w are shared with the CPU's blocks."""
+    import numpy as np
+
+    from vllm.model_executor.layers.quantization.utils import (
+        moe_w2_ep, moe_w2_helper)
+    if moe_w2_ep.active():
+        raise RuntimeError("VLLM_MOE_W2_HELPER_GB: one main GPU only (no EP)")
+    n, E, sb = len(keys), int(st["E"]), int(btier.slot_bytes)
+    skip = int(os.getenv("VLLM_MOE_W2_HELPER_SKIP", str(btier.n_slots)))
+    sets = moe_w2_helper.warm_sets(keys, E, sb, skip)
+    _S.g_split = moe_w2_helper.split_mode()
+    store = btier._store
+
+    def fetch(i, ids):
+        return store.rows_for([(keys[i], e) for e in ids])
+
+    pin = dict(dtype=torch.int32, pin_memory=True)
+    _S.g_hdr = torch.zeros((n, _HDR), **pin)
+    _S.g_glob = torch.zeros(8, dtype=torch.int64, pin_memory=True)
+    _S.g_msk = torch.zeros((n, _TCAP * _KCAP), **pin)
+    _S.g_y = torch.zeros((n, _TCAP, H), dtype=torch.float32, pin_memory=True)
+    _S.g_wait = torch.zeros(2, dtype=torch.int64, device=btier.dev)
+    own = torch.zeros((n, E), **pin)
+    for i, ids in enumerate(sets):
+        if ids:
+            own[i, torch.tensor(ids)] = 1
+    _S.g_own = own
+    _S.g_snap = torch.zeros((n, E), dtype=torch.int32, device=btier.dev)
+    # fallback for the helper's dropped routes: the layer's top-ranked
+    # expert outside the start set; never handed to the helper
+    rank = moe_w2_helper.ranking(keys, E)
+    fb = []
+    for i, k in enumerate(keys):
+        held = set(sets[i])
+        fb.append(next((e for e in rank[k] if e not in held), 0))
+    _S.g_fb = torch.tensor(fb, dtype=torch.int32, device=btier.dev)
+    dyn = moe_w2_helper.dynamic()
+    if dyn:
+        _S.g_cnt = torch.zeros((n, E), dtype=torch.int32, device=btier.dev)
+    raw = (np.fromfile(os.environ["VLLM_MOE_W2_VQ"], dtype=np.uint8)
+           if vq else None)
+    hlp = moe_w2_helper.Helper(
+        _S, None, sb, st["off_s13"], st["off_c2"], st["off_s2"], H, I, E,
+        _KCAP, _TCAP, float(lim) if lim is not None else None,
+        sets=sets, fetch=fetch, msk=_S.g_msk, y=_S.g_y, vq=raw,
+        pool_rows=int(moe_w2_helper.warm_gb() * 2**30 // sb) if dyn else 0)
+    ex = (ctypes.c_uint64 * len(hlp.execs))(*hlp.execs)
+    bk = (ctypes.c_int * len(hlp.bucket_of))(*hlp.bucket_of)
+    _S.helper = hlp
+    _S.g_eng = _S.lib.w2e_create_gpu(
+        n, _S.g_hdr.data_ptr(), _S.g_glob.data_ptr(), hlp.ctx,
+        hlp.stream.cuda_stream, ex, len(hlp.buckets), bk)
+    if not _S.g_eng:
+        raise RuntimeError("helper GPU engine: libcuda symbols missing")
+    if dyn:
+        _S.g_dyn = _DynHelper(btier, keys, hlp, fb)
+    logger.info("moe_w2 helper warm set: %d experts %s (%.1f GiB), per "
+                "layer %d..%d", sum(len(x) for x in sets),
+                ("owned, every other of the top ranks (alt split)"
+                 + (" as the start of a dynamic cache" if dyn else ""))
+                if _S.g_split else f"after the top {skip}",
+                sum(len(x) for x in sets) * sb / 2**30,
+                min(len(x) for x in sets), max(len(x) for x in sets))
+
+
 def request(layer_key: int, x: torch.Tensor, topk_ids: torch.Tensor,
             topk_weights: torch.Tensor, btier, ftier=None) -> bool:
     """Decode MoE input (before the descriptor build): hand this layer's
@@ -451,6 +588,10 @@ def request(layer_key: int, x: torch.Tensor, topk_ids: torch.Tensor,
     H = x.shape[1]
     slot_row = btier.slot_table[layer_key]
     frow = ftier.slot_table[layer_key] if ftier is not None else slot_row
+    if _S.g_eng and not _S.g_split:
+        # split mode took this call's snapshot in helper_own (the remap and
+        # this request must see the same ownership)
+        _S.g_snap[i].copy_(_S.g_own[i], non_blocking=True)
     xc = x.contiguous()
     _req_kernel[(T, triton.cdiv(H, 1024))](
         xc.view(torch.int16), topk_ids.contiguous(), topk_weights.contiguous(),
@@ -459,7 +600,13 @@ def request(layer_key: int, x: torch.Tensor, topk_ids: torch.Tensor,
         top_k, _S.E, _PCIE if _PCIE > 0 else 1 << 20,
         int(_FRAC * 65536) if _FRAC > 0 else 1 << 20,
         _S.rmap[i] if _S.rmap is not None else slot_row,
+        _S.g_snap[i] if _S.g_eng else slot_row,
+        _S.g_msk[i].data_ptr() if _S.g_eng else 0,
+        _S.g_hdr[i].data_ptr() if _S.g_eng else 0,
+        _S.g_cnt[i] if _S.g_cnt is not None else slot_row,
         HAS_F=ftier is not None, SPLIT=_SPLIT, ROWMAP=_S.rmap is not None,
+        HELP=bool(_S.g_eng), HALL=bool(_S.g_eng) and _S.g_split,
+        CNT=_S.g_cnt is not None,
         # R sized to this call's routes: the SPLIT ranking is O(R^2) in one
         # program (R = cap x 8 = 256 cost ~9% at 1 user)
         KCAP=_KCAP, R=triton.next_power_of_2(T * _KCAP),
@@ -467,6 +614,9 @@ def request(layer_key: int, x: torch.Tensor, topk_ids: torch.Tensor,
         BLOCK=1024)
     _ring_kernel[(1,)](_S.seq, int(layer_key == _S.first_key),
                        _S.hdr[i].data_ptr(), _S.glob.data_ptr(), i, T)
+    if _S.g_eng:
+        _gring_kernel[(1,)](_S.seq, _S.g_hdr[i].data_ptr(),
+                            _S.g_glob.data_ptr(), i, T)
     return True
 
 
@@ -483,6 +633,26 @@ def hint(layer_key: int, pred: torch.Tensor) -> None:
     _hint_kernel[(1,)](pred.contiguous(), n, _S.hids[i].data_ptr(),
                        _S.hhdr[i].data_ptr(), _S.hseq,
                        BLOCK=triton.next_power_of_2(_HINT_MAX), num_warps=1)
+
+
+def helper_split(layer_key: int, T: int) -> bool:
+    """Alt split on for this decode call: the main GPU drops the helper's
+    routes (moe_w2_helper.remap) and request() gets the full routing."""
+    return (_S.g_split and _S.g_eng is not None and on() and T <= _TCAP
+            and layer_key in _S.key_idx)
+
+
+def mark_serving() -> None:
+    _S.serving = True
+
+
+def helper_own(layer_key: int):
+    """Split mode, once per decode call before the remap: snapshot the
+    helper's ownership row (host-written by _DynHelper) to the device ->
+    (own [E] i32, fallback expert [1] i32); request() reads the same copy."""
+    i = _S.key_idx[layer_key]
+    _S.g_snap[i].copy_(_S.g_own[i], non_blocking=True)
+    return _S.g_snap[i], _S.g_fb[i:i + 1]
 
 
 def rowmap(layer_key: int):
@@ -505,6 +675,11 @@ def join(layer_key: int, out: torch.Tensor) -> None:
                        SPIN=_SPIN)
     _add_kernel[(T, triton.cdiv(H, 1024))](out, _S.y[i].data_ptr(), H,
                                           BLOCK=1024)
+    if _S.g_eng:
+        _wait_kernel[(1,)](_S.seq, _S.g_hdr[i].data_ptr(), _S.err, _S.g_wait,
+                           SPIN=_SPIN)
+        _add_if_kernel[(T, triton.cdiv(H, 1024))](
+            out, _S.g_y[i].data_ptr(), _S.g_hdr[i].data_ptr(), H, BLOCK=1024)
 
 
 def raw_stats() -> list | None:
@@ -534,7 +709,178 @@ def kpi_summary() -> str:
     return (f"; CPU experts: {pairs} pairs in {jobs} layer jobs, "
             f"{ns / max(jobs, 1) / 1e3:.0f} us/job (max {mx / 1e3:.0f}; "
             f"prep/w13/act/w2 {ph}), GPU wait {_wait_us():.0f} us/layer, "
-            f"ack timeouts {int(_S.err.item())}{cold}")
+            f"ack timeouts {int(_S.err.item())}{cold}{_helper_kpi()}")
+
+
+def _helper_kpi() -> str:
+    if not _S.g_eng:
+        return ""
+    s = (ctypes.c_uint64 * 33)()
+    _S.lib.w2e_stats(_S.g_eng, s)
+    ns, n = _S.g_wait.tolist()
+    return (f"; helper GPU: {s[0]} layer jobs, wait {ns / max(n, 1) / 1e3:.0f}"
+            f" us/layer" + (_S.g_dyn.kpi() if _S.g_dyn is not None else ""))
+
+
+class _DynHelper:
+    """Dynamic helper cache (VLLM_MOE_W2_HELPER_SPLIT=dyn), one rule: the
+    helper holds the hottest experts the main GPU does not serve. Hotness =
+    decayed count of routes the main GPU missed (_req_kernel CNT: helper's
+    and CPU's), same half-life as the main pool. Each pass loads the
+    hottest CPU-served experts into free rows and frees the coldest held
+    ones that a candidate beats by MARGIN; an expert the main pool took
+    (prefill fills) leaves the helper (YIELD, default on). Exclusive with
+    the main GPU.
+
+    Ownership change order (a route is never dropped or computed twice):
+    admit = load row, sync, map it on the helper, THEN set g_own (host);
+    evict = clear g_own, then free the row once the step counter shows
+    every step that could have snapshotted the old bit has finished."""
+
+    def __init__(self, btier, keys, hlp, fb):
+        import threading
+
+        import numpy as np
+        self.np = np
+        self.bt, self.keys, self.h = btier, list(keys), hlp
+        n, E = _S.g_own.shape
+        self.n, self.E = n, E
+        self.own = _S.g_own.numpy()
+        self.never = np.zeros((n, E), bool)
+        self.never[np.arange(n), np.asarray(fb)] = True
+        self.score = np.zeros((n, E))
+        self.cnt_h = torch.zeros((n, E), dtype=torch.int32, pin_memory=True)
+        self.last = np.zeros((n, E), np.int64)
+        self.pending = []           # (seq to wait for, layer idx, expert)
+        self.busy = np.zeros((n, E), bool)
+        self.fill = int(os.getenv("VLLM_MOE_W2_HELPER_FILL", "16"))
+        self.margin = float(os.getenv("VLLM_MOE_W2_HELPER_MARGIN", "1.25"))
+        self.half = float(os.getenv("VLLM_MOE_W2_DELTA_DECAY_S", "30"))
+        self.yield_ = os.getenv("VLLM_MOE_W2_HELPER_YIELD", "1") == "1"
+        self.period = float(os.getenv("VLLM_MOE_W2_HELPER_PERIOD_MS", "10")) / 1e3
+        self.loads = self.evicts = self.yields = self.cold_skips = 0
+        self.side = torch.cuda.Stream(device=btier.dev)
+        self.ev = torch.cuda.Event()
+        rm = getattr(btier._store, "_rowmaps", None)
+        self.rowmaps = [rm[k] if rm is not None else None for k in self.keys]
+        self.th = threading.Thread(target=self._loop, name="moe_w2_dynhelper",
+                                   daemon=True)
+        self.th.start()
+
+    def _seq(self) -> int:
+        return int(_S.glob[0]) >> 7
+
+    def _loop(self) -> None:
+        import time
+        # no CUDA calls from this thread until vLLM's graph capture is over
+        # (global-mode capture fails on another thread's stream work): wait
+        # until the worker finished capture (gpu_worker.compile_or_warm_up_model)
+        while not _S.serving:
+            time.sleep(0.5)
+        t_last = time.monotonic()
+        while True:
+            time.sleep(self.period)
+            try:
+                now = time.monotonic()
+                self._pass(0.5 ** ((now - t_last) / self.half))
+                t_last = now
+            except Exception as e:  # noqa: BLE001 - never kill serving
+                logger.warning_once("moe_w2 dynamic helper pass failed: %s", e)
+
+    def _pass(self, decay: float) -> None:
+        np = self.np
+        with torch.cuda.device(self.bt.dev), torch.cuda.stream(self.side):
+            self.cnt_h.copy_(_S.g_cnt, non_blocking=True)
+            self.ev.record(self.side)
+        self.ev.synchronize()
+        c = self.cnt_h.numpy().astype(np.int64)
+        delta = c - self.last
+        self.last = c
+        self.score *= decay
+        self.score += delta
+        seq = self._seq()
+        # rows of evicted experts: free once no running step can route there
+        keep = []
+        for need, i, e in self.pending:
+            if seq >= need:
+                self.h.free_rows.append(self.h.unpublish(i, e))
+                self.busy[i, e] = False
+            else:
+                keep.append((need, i, e))
+        self.pending = keep
+        mirror = self.bt._mirror
+        held = self.own != 0
+        # the main pool took it (prefill fills): main wins, the helper lets
+        # go. RH5: 25.8 tok/s against 25.3 with YIELD=0 (3.7x fewer loads,
+        # but the helper then computes routes main holds: wait 16 -> 60 us)
+        for i, k in (enumerate(self.keys) if self.yield_ else ()):
+            row = held[i]
+            if row.any():
+                both = np.flatnonzero(row & (mirror[k].numpy() >= 0))
+                for e in both:
+                    self._evict(i, int(e))
+                    self.yields += 1
+        if not delta.any():
+            return
+        held = self.own != 0
+        cand = (delta > 0) & ~held & ~self.never & ~self.busy
+        for i, k in enumerate(self.keys):
+            if cand[i].any():
+                cand[i] &= mirror[k].numpy() < 0
+        ci, ce = np.nonzero(cand)
+        if ci.size == 0:
+            return
+        order = np.argsort(-self.score[ci, ce], kind="stable")[:self.fill]
+        ci, ce = ci[order], ce[order]
+        # evict the coldest held experts the candidates beat
+        hs = np.where(held & ~self.busy, self.score, np.inf)
+        # rows already on their way back count as free
+        need = max(0, len(ci) - len(self.h.free_rows) - len(self.pending))
+        if need:
+            flat = np.argpartition(hs.ravel(), min(need, hs.size - 1))[:need]
+            vic = sorted(flat, key=lambda f: hs.ravel()[f])
+            best = sorted(self.score[ci, ce], reverse=True)
+            for f, sc in zip(vic, best):
+                vs = hs.ravel()[f]
+                if not np.isfinite(vs) or sc <= vs * self.margin + 1.0:
+                    break
+                self._evict(*map(int, np.unravel_index(f, hs.shape)))
+        # admit into free rows
+        adm = []
+        for i, e in zip(ci.tolist(), ce.tolist()):
+            if not self.h.free_rows:
+                break
+            rmap = self.rowmaps[i]
+            if rmap is not None and rmap[e] < 0:
+                self.cold_skips += 1      # not pinned: stays a CPU expert
+                continue
+            adm.append((i, e, self.h.free_rows.pop()))
+        if not adm:
+            return
+        with self.bt._lock:
+            rows = self.bt._store.rows_for(
+                [(self.keys[i], e) for i, e, _r in adm])
+            for (i, e, r), src in zip(adm, rows):
+                self.h.load_row(r, src)
+            self.h.sync_loads()
+        for i, e, r in adm:
+            self.h.publish(i, e, r)
+            self.own[i, e] = 1
+            self.loads += 1
+
+    def _evict(self, i: int, e: int) -> None:
+        self.own[i, e] = 0
+        self.busy[i, e] = True
+        self.evicts += 1
+        # steps up to the current one may hold the old bit; seq + 2 starts
+        # only after seq + 1 started, i.e. after seq finished (its joins
+        # waited for every helper job of that step)
+        self.pending.append((self._seq() + 2, i, e))
+
+    def kpi(self) -> str:
+        return (f", dynamic: {len(self.h.row_of)} held, {self.loads} loads, "
+                f"{self.evicts} evictions ({self.yields} to the main GPU)"
+                + (f", {self.cold_skips} cold skips" if self.cold_skips else ""))
 
 
 def _wait_us() -> float:

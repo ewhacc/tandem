@@ -66,6 +66,9 @@ def layer_idx_from_name(layer_name: str) -> int | None:
 
 
 def _tp_ids() -> tuple[int, int]:
+    from vllm.model_executor.layers.quantization.utils import moe_w2_ep
+    if moe_w2_ep.enabled():
+        return 1, 0          # whole experts per rank: the TP=1 planes
     from vllm.distributed.parallel_state import (
         get_tensor_model_parallel_rank,
         get_tensor_model_parallel_world_size,

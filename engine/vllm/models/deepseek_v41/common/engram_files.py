@@ -141,8 +141,12 @@ class _State:
 def register(emb, prefix: str, max_tokens: int) -> None:
     """Called by the embedding at construction: map its table files."""
     from vllm.config import get_current_vllm_config
-    if emb.tp_size != 1 or emb.dp_size != 1:
-        raise ValueError("VLLM_TANDEM_ENGRAM_FILES: TP1 without Engram DP only")
+    if emb.dp_size != 1:
+        raise ValueError("VLLM_TANDEM_ENGRAM_FILES: no Engram DP")
+    if emb.n_hash_cols % emb.tp_size:
+        # a padded last shard would publish fewer heads than it stages
+        raise ValueError(f"VLLM_TANDEM_ENGRAM_FILES: {emb.n_hash_cols} hash "
+                         f"heads do not split evenly over TP={emb.tp_size}")
     m = re.search(r"layers\.(\d+)\.engram", prefix)
     if m is None:
         raise ValueError(f"VLLM_TANDEM_ENGRAM_FILES: no layer id in {prefix!r}")
@@ -150,10 +154,12 @@ def register(emb, prefix: str, max_tokens: int) -> None:
     model = get_current_vllm_config().model_config.model
     wpath, woff, wshape = _table_file(model, f"layers.{lid}.engram.embed.weight")
     spath, soff, sshape = _table_file(model, f"layers.{lid}.engram.embed.scale")
-    if (wshape[0] != emb.part_num_embeddings or sshape[0] != wshape[0]
+    # the files hold every head's rows; TP ranks read their own heads' rows
+    # (global row ids, vocab_start..vocab_end) from the same files
+    if (wshape[0] < emb.vocab_end_idx or sshape[0] != wshape[0]
             or wshape[1] != emb.row_bytes or sshape[1] != emb.dim // emb.block_size):
         raise ValueError(f"layer {lid} Engram table {wshape}/{sshape} does not "
-                         f"match the model ({emb.part_num_embeddings} x "
+                         f"match the model ({emb.vocab_end_idx} x "
                          f"{emb.row_bytes}, {emb.dim // emb.block_size})")
     heads = emb.part_n_hash_cols
     dev = torch.device("cuda", torch.accelerator.current_device_index())
@@ -200,6 +206,8 @@ def publish(emb, hash_ids: torch.Tensor) -> None:
     _start()
     L = _State.layers[id(emb)]
     n = hash_ids.shape[0] * emb.part_n_hash_cols
+    if emb.tp_size > 1:      # this rank's heads (global row ids)
+        hash_ids = hash_ids[:, emb.head_start:emb.head_start + emb.part_n_hash_cols]
     if n:
         _publish_kernel[(triton.cdiv(n, 1024),)](
             hash_ids, hash_ids.stride(0), hash_ids.stride(1), L.req.data_ptr(),

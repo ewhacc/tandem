@@ -13,6 +13,7 @@ vllm/model_executor/layers/quantization/utils/moe_w2_cpu.cpp
 vllm/model_executor/layers/quantization/utils/moe_w2_cpu.py
 vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
+vllm/model_executor/layers/quantization/utils/moe_w2_ep.py
 vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py
 vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 vllm/model_executor/layers/quantization/utils/moe_w2_helper.py
@@ -49,6 +50,9 @@ vllm/models/deepseek_v41/common/engram.py
 vllm/models/deepseek_v41/common/engram_e2m1.py
 vllm/models/deepseek_v41/common/engram_files.cpp
 vllm/models/deepseek_v41/common/engram_files.py
+vllm/models/deepseek_v41/common/ops/cache_utils.py
+vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py
+vllm/models/deepseek_v41/common/ops/indexer_k_store.py
 vllm/models/deepseek_v41/compressor.py
 vllm/models/deepseek_v41/nvidia/engram.py
 vllm/models/deepseek_v41/nvidia/model.py

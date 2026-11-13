@@ -9,11 +9,14 @@
 #   --check   only check the prerequisites
 #
 # Steps:
-#   1. prerequisites: Linux x86-64, NVIDIA driver + SM120 GPU (RTX 50xx / RTX PRO 6000
-#      Blackwell), CUDA toolkit with nvcc (FlashInfer builds its kernels at first use),
-#      Python 3.12, g++ (the CPU expert engine is compiled at first use, -march=native),
+#   1. prerequisites: Linux x86-64, NVIDIA driver + a supported GPU: SM120 (RTX 50xx / RTX PRO
+#      6000 Blackwell), SM90 (H100/H200), SM89 (RTX 40xx / RTX 6000 Ada / L40), SM86 (RTX 30xx /
+#      RTX A6000). CUDA toolkit with nvcc
+#      (FlashInfer builds its kernels at first use), Python 3.12 with venv, or uv (it can fetch
+#      Python 3.12 itself), g++ (the CPU expert engine is compiled at first use, -march=native),
 #      a CPU with AVX2 (AVX-512 is used when present)
-#   2. venv + the stock vLLM 0.31.0 wheel from PyPI (pulls torch, FlashInfer 0.7.0.post1)
+#   2. venv + the stock vLLM 0.31.0 wheel from PyPI (pulls torch, FlashInfer 0.7.0.post1);
+#      made with python -m venv + pip, or with uv when Python 3.12's venv module is missing
 #   3. Tandem engine files copied over the wheel's (originals kept as <file>.orig)
 #   4. DeepSeek-V4.1 SM120 kernel fixes: FlashInfer page-32 sparse-MLA sources
 #      (patch_flashinfer_dsv41.py) and DeepGEMM _C with 128-row indexer pages (prebuilt)
@@ -56,7 +59,14 @@ die() { echo "[tandem-install] ERROR: $*" >&2; exit 1; }
 [ "$(uname -s)-$(uname -m)" = Linux-x86_64 ] || die "Linux x86-64 only"
 command -v nvidia-smi > /dev/null || die "nvidia-smi not found (NVIDIA driver)"
 CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | sort -u | tr '\n' ' ')
-case " $CC" in *" 12.0"*) ;; *) die "no SM120 GPU found (compute capability: $CC); Tandem's kernels are SM120-only for now" ;; esac
+GOOD=0
+for c in $CC; do
+  case $c in
+    12.0|9.0|8.9|8.6) GOOD=1 ;;
+    *) say "warning: GPU with compute capability $c is not supported; do not use it with Tandem" ;;
+  esac
+done
+[ "$GOOD" = 1 ] || die "no supported GPU (compute capability: $CC); Tandem runs on SM120 (RTX 50xx / PRO 6000 Blackwell), SM90 (H100/H200), SM89 (RTX 40xx / Ada), SM86 (RTX 30xx / A6000)"
 NVCC=$(command -v nvcc || true)
 for d in ${CUDA_HOME:-} /usr/local/cuda /usr/local/cuda-13.0 /usr/local/cuda-13; do
   [ -z "$NVCC" ] && [ -n "$d" ] && [ -x "$d/bin/nvcc" ] && NVCC=$d/bin/nvcc
@@ -65,15 +75,21 @@ done
 CUDA_HOME=$(dirname "$(dirname "$NVCC")")
 NVCC_VER=$("$NVCC" --version | grep -o 'release [0-9.]*' | cut -d' ' -f2)
 case $NVCC_VER in 13.*) ;; *) die "CUDA toolkit $NVCC_VER at $CUDA_HOME; need 13.x" ;; esac
-command -v "$PY" > /dev/null || die "$PY not found (Python 3.12; e.g. pyenv install 3.12)"
-"$PY" -c 'import sys; assert sys.version_info[:2] == (3, 12)' || die "$PY is not Python 3.12"
+UV=$(command -v uv || { [ -x "$HOME/.local/bin/uv" ] && echo "$HOME/.local/bin/uv"; } || true)
+if command -v "$PY" > /dev/null && "$PY" -c 'import sys, venv, ensurepip; assert sys.version_info[:2] == (3, 12)' 2> /dev/null; then
+  MKVENV=python; PYDESC=$("$PY" -V)
+elif [ -n "$UV" ]; then   # no python3.12, or no venv/ensurepip module (Debian/Ubuntu without python3.12-venv)
+  MKVENV=uv; case $PY in python3.12) UVPY=3.12 ;; *) UVPY=$PY ;; esac; PYDESC="uv $("$UV" --version | cut -d' ' -f2), Python $UVPY"
+else
+  die "need Python 3.12 with its venv module ($PY; e.g. apt install python3.12-venv, or pyenv install 3.12) or uv (https://docs.astral.sh/uv/)"
+fi
 command -v g++ > /dev/null || die "g++ not found (build-essential): the CPU expert engine is compiled at first use"
 grep -qw avx2 /proc/cpuinfo || die "CPU without AVX2"
 ISA=avx2; grep -qw avx512f /proc/cpuinfo && ISA=avx512
 [ -d "$SRC/vllm" ] || die "engine source $SRC not found (--src)"
 [ -f "$DG_SO" ] || die "prebuilt DeepGEMM _C not found at $DG_SO (DG_SO=...)"
 [ -d "$CUBINS" ] || die "SM120 cubins not found at $CUBINS (CUBINS=...)"
-say "ok: GPU compute ${CC% }, CUDA $NVCC_VER ($CUDA_HOME), $("$PY" -V), g++ $(g++ -dumpversion), CPU $ISA"
+say "ok: GPU compute ${CC% }, CUDA $NVCC_VER ($CUDA_HOME), $PYDESC, g++ $(g++ -dumpversion), CPU $ISA"
 [ "$CHECK" = 1 ] && exit 0
 
 # ---- 2. venv + stock vLLM wheel
@@ -83,10 +99,15 @@ if [ -e "$PREFIX/bin/vllm" ]; then   # re-run (e.g. after a failed step): keep t
   [ "$have" = "$VLLM_VER" ] || die "$PREFIX has vLLM $have; pick a new --prefix"
   say "reusing $PREFIX (vllm $have)"
 else
-  "$PY" -m venv "$PREFIX"
-  "$VPY" -m pip install -q --upgrade pip
   say "installing vllm==$VLLM_VER (several GB)"
-  "$VPY" -m pip install -q "vllm==$VLLM_VER" ninja
+  if [ "$MKVENV" = uv ]; then
+    "$UV" venv -q --seed --python "$UVPY" "$PREFIX"
+    "$UV" pip install -q --python "$VPY" "vllm==$VLLM_VER" ninja
+  else
+    "$PY" -m venv "$PREFIX"
+    "$VPY" -m pip install -q --upgrade pip
+    "$VPY" -m pip install -q "vllm==$VLLM_VER" ninja
+  fi
 fi
 FI=$("$VPY" -c "import importlib.metadata as m; print(m.version('flashinfer-python'))")
 [ "$FI" = "$FI_VER" ] || die "FlashInfer $FI installed; the V4.1 patch needs $FI_VER"
