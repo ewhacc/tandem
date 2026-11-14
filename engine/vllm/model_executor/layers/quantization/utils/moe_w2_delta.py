@@ -3000,9 +3000,13 @@ def get_base_tier(n_layers: int, n_experts: int, dev,
         # by check_pool_floor at end-of-load — the old layers*16 heuristic
         # here double-floored valid configs (e.g. DS4 no-spec single-seq:
         # calibrated floor 304 slots, heuristic demanded 704).
-        assert _BASE_TIER.n_slots >= 2 * n_experts, (
+        # tensor parallel (moe_w2_ep): a rank only ever pools its own
+        # experts (E / world per layer), so its prefill layer needs that many
+        from vllm.model_executor.layers.quantization.utils import moe_w2_ep
+        e_own = -(-n_experts // moe_w2_ep.ids()[0])
+        assert _BASE_TIER.n_slots >= 2 * e_own, (
             f"moe_w2 base cache: pool of {_BASE_TIER.n_slots} slots cannot "
-            f"hold even one prefill layer (2*E={2 * n_experts}); raise "
+            f"hold even one prefill layer (2 x {e_own} own experts); raise "
             f"VLLM_MOE_W2_BASE_CACHE_GB")
         if _BASE_MANAGER:
             _BASE_TIER.start()

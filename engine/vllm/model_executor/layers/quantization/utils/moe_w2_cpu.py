@@ -485,7 +485,13 @@ def arm(btier) -> None:
                 raise RuntimeError(f"VLLM_MOE_W2_VQ: CPU engine refused the "
                                    f"table (rc {rc}, H={H} I={I})")
         if hybrid:
-            _arm_helper(btier, keys, st, H, I, lim, vq)
+            try:
+                _arm_helper(btier, keys, st, H, I, lim, vq)
+            except Exception as e:  # noqa: BLE001 - keep the CPU experts
+                logger.warning("moe_w2 helper GPU disabled (CPU experts "
+                               "stay on): %s", e)
+                _S.g_eng = _S.g_dyn = _S.g_cnt = None
+                _S.g_split = False
         _S.armed = True
         logger.info("moe_w2 CPU experts armed (%s%s): %d layers, %d threads, "
                     "H=%d I=%d, swiglu limit %s, PCIe share: up to %d "
@@ -516,11 +522,20 @@ def _arm_helper(btier, keys, st, H, I, lim, vq) -> None:
 
     from vllm.model_executor.layers.quantization.utils import (
         moe_w2_ep, moe_w2_helper)
-    if moe_w2_ep.active():
-        raise RuntimeError("VLLM_MOE_W2_HELPER_GB: one main GPU only (no EP)")
     n, E, sb = len(keys), int(st["E"]), int(btier.slot_bytes)
     skip = int(os.getenv("VLLM_MOE_W2_HELPER_SKIP", str(btier.n_slots)))
-    sets = moe_w2_helper.warm_sets(keys, E, sb, skip)
+    # tensor parallel (moe_w2_ep): every rank runs its own helper on the
+    # shared helper GPU over its own experts only; the rank's EP fallback
+    # (the weight-0 target of other ranks' routes) stays on the main GPU
+    ep_fb = None
+    allow = None
+    if moe_w2_ep.active():
+        if not moe_w2_helper.split_mode():
+            raise RuntimeError("helper GPU with tensor parallel needs "
+                               "VLLM_MOE_W2_HELPER_SPLIT=alt or dyn")
+        ep_fb = {k: int(moe_w2_ep.tables(k, E, "cpu")[1]) for k in keys}
+        allow = (lambda li, ei: moe_w2_ep.local(ei) and ei != ep_fb[li])
+    sets = moe_w2_helper.warm_sets(keys, E, sb, skip, allow)
     _S.g_split = moe_w2_helper.split_mode()
     store = btier._store
 
@@ -545,7 +560,8 @@ def _arm_helper(btier, keys, st, H, I, lim, vq) -> None:
     fb = []
     for i, k in enumerate(keys):
         held = set(sets[i])
-        fb.append(next((e for e in rank[k] if e not in held), 0))
+        fb.append(ep_fb[k] if ep_fb is not None else
+                  next((e for e in rank[k] if e not in held), 0))
     _S.g_fb = torch.tensor(fb, dtype=torch.int32, device=btier.dev)
     dyn = moe_w2_helper.dynamic()
     if dyn:
@@ -762,7 +778,9 @@ class _DynHelper:
         self.side = torch.cuda.Stream(device=btier.dev)
         self.ev = torch.cuda.Event()
         rm = getattr(btier._store, "_rowmaps", None)
-        self.rowmaps = [rm[k] if rm is not None else None for k in self.keys]
+        # all experts pinned (no RAM_GB): no row maps; tensor parallel: -1 =
+        # another rank's expert (never a candidate here)
+        self.rowmaps = [rm.get(k) if rm else None for k in self.keys]
         self.th = threading.Thread(target=self._loop, name="moe_w2_dynhelper",
                                    daemon=True)
         self.th.start()

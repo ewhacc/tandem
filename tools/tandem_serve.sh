@@ -64,9 +64,12 @@ VENV=${VENV:-$HOME/.venvs/tandem}
 export PATH="$VENV/bin:$PATH"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=${GPU:-0}
 if [ -n "${HELPER_GPU:-}" ]; then
-  case "${GPU:-0}" in *,*) echo "HELPER_GPU needs one main GPU (GPU=${GPU})" >&2; exit 2 ;; esac
-  export CUDA_VISIBLE_DEVICES=${GPU:-0},$HELPER_GPU VLLM_MOE_W2_CPU_HELPER=1
-  export VLLM_MOE_W2_HELPER_GB=${HELPER_GB:-20} VLLM_MOE_W2_HELPER_SPLIT=${HELPER_SPLIT:-dyn}
+  # with GPU=0,1 (tensor parallel) every GPU process runs its own helper on HELPER_GPU over its own experts,
+  # with an equal share of HELPER_GB
+  HN=$(echo "${GPU:-0}" | tr ',' '\n' | grep -c .)
+  [ "$HN" -gt 1 ] && [ "${HELPER_SPLIT:-dyn}" = slice ] && { echo "HELPER_SPLIT=slice needs one main GPU" >&2; exit 2; }
+  export CUDA_VISIBLE_DEVICES=${GPU:-0},$HELPER_GPU VLLM_MOE_W2_CPU_HELPER=$HN
+  export VLLM_MOE_W2_HELPER_GB=$(awk "BEGIN{print ${HELPER_GB:-20} / $HN}") VLLM_MOE_W2_HELPER_SPLIT=${HELPER_SPLIT:-dyn}
 fi
 
 # expert stores: from the package (engine side); FP4 count

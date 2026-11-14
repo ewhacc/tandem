@@ -128,6 +128,12 @@ def apply_package_env(model: str) -> bool:
         raise ValueError("VLLM_TANDEM_FP4_TOP: this package has no FP4 hot-set store")
     if k == 0:
         env.setdefault("VLLM_MOE_W2_DELTA_GB", "0")
+    if t.get("fp4_hot"):
+        # the package ranking: the RAM tier's pin order, and also the helper
+        # GPU's start set and the tensor-parallel fallback expert (needed
+        # with all experts pinned too, i.e. without RAM_GB)
+        env.setdefault("VLLM_MOE_W2_BASE_RAM_RANK",
+                       os.path.join(model, t["fp4_hot"], "ranking.tsv"))
     ram = env.get("VLLM_TANDEM_RAM_GB", "").strip()
     if ram:
         if not t.get("fp4_hot"):
@@ -135,8 +141,6 @@ def apply_package_env(model: str) -> bool:
                              "(<fp4_hot>/ranking.tsv)")
         env.setdefault("VLLM_MOE_W2_BASE_FILES", "1")
         env.setdefault("VLLM_MOE_W2_BASE_RAM_GB", ram)
-        env.setdefault("VLLM_MOE_W2_BASE_RAM_RANK",
-                       os.path.join(model, t["fp4_hot"], "ranking.tsv"))
         # pinned misses: a share over PCIe (DIRECT), the rest on the CPU. Both
         # read the same DRAM, so past ~0.3 the link starves the CPU (PC8:
         # 14600KF DDR4 + 5090: 0.3 +12%, 0.5+ slower; EX1 epyc: 0.5 +19% c1)

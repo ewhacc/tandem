@@ -107,11 +107,15 @@ def ranking(keys, n_experts: int) -> dict:
     return out
 
 
-def warm_sets(keys, n_experts: int, slot_bytes: int, skip: int) -> list:
+def warm_sets(keys, n_experts: int, slot_bytes: int, skip: int,
+              allow=None) -> list:
     """Per layer key (in `keys` order) the helper's expert ids: the global
     ranking (tsv `layer rank expert count`, count desc) minus its first
-    `skip` entries, as many as fit in VLLM_MOE_W2_HELPER_GB."""
+    `skip` entries, as many as fit in VLLM_MOE_W2_HELPER_GB. allow(li, ei)
+    (tensor parallel, moe_w2_ep): only this rank's experts are candidates."""
     ent = _rank_entries(keys, n_experts)
+    if allow is not None:
+        ent = [t for t in ent if allow(t[1], t[2])]
     n = int(warm_gb() * 2**30 // slot_bytes)
     take = ent[1:2 * n:2] if split_mode() else ent[skip:skip + n]
     sets = {k: [] for k in keys}

@@ -1,4 +1,4 @@
-# Tandem-vLLM 0.2.0
+# Tandem-vLLM 0.2.1
 
 Run DeepSeek-V4.1-Flash on one or two workstation GPUs. The routed experts live in host RAM as
 2-bit VQ codes, a GPU cache holds the most-used ones, and missed experts are computed by the CPU in parallel
@@ -24,7 +24,7 @@ built for workstation and server-class machines:
 
 | | recommended | practical minimum (estimate) | runs, slowly |
 |---|---|---|---|
-| GPU | 96 GB SM120 (RTX PRO 6000 Blackwell) | 48 GB, or 2× 24 GB (main + helper GPU) | 32 GB (RTX 5090: `BASE_GB=10`, no drafter); one 24 GB card (`BASE_GB=7`) |
+| GPU | 96 GB SM120 (RTX PRO 6000 Blackwell) | 48 GB, 2× 24 GB (main + helper GPU), or 2× 16 GB (tensor parallel) | 32 GB (RTX 5090: `BASE_GB=10`, no drafter); one 24 GB card (`BASE_GB=7`) |
 | RAM | 256 GB+ (all experts and Engram pinned; engine RSS 233 GiB) | 128 GB + RAID0 NVMe | 128 GB (`RAM_GB=90 ENGRAM=files`) |
 | CPU | AVX-512, 16+ cores, DDR5 (the CPU experts are memory-bandwidth-bound) | AVX2, 8+ cores | |
 | speed, 1 / 4 / 32 streams | 65 / 182 / 414 tok/s (124 at 1 stream with DSpark) | | 16 / 20 / – tok/s |
@@ -41,8 +41,9 @@ Supported GPUs:
 | SM89 (Ada) | RTX 40xx, RTX 6000 Ada, L40 | portable, e4m3 | RTX 6000 Ada |
 | SM86 (Ampere) | RTX 30xx, RTX A6000 | portable, f16 | RTX A6000, also limited to 24 GB (3090/4090 memory) |
 
-Every portable kernel is checked against a reference at boot. The KV cache is fp8 on every GPU. 16 GB cards do not fit as the main GPU: the non-expert weights
-plus one double-buffered prefill layer need about 19–20 GiB. A 24 GB card fits with `BASE_GB=7` (about 450 MiB to
+Every portable kernel is checked against a reference at boot. The KV cache is fp8 on every GPU. One 16 GB card does not fit: the non-expert weights
+plus one double-buffered prefill layer need about 19–20 GiB. Two 16 GB cards fit in tensor parallel, where each GPU holds
+half of both (`GPU=0,1 BASE_GB=3.5 KV_GB=1 CHUNK=1024`). A 24 GB card fits with `BASE_GB=7` (about 450 MiB to
 spare) and runs best with a second card as a helper GPU (see [Two GPUs](#two-gpus)).
 On a desktop CPU (two memory channels, fewer cores) the CPU's work on the missed experts sets the decode speed.
 
@@ -56,8 +57,8 @@ Two ways to use a second card:
 
 | mode | how | best for |
 |---|---|---|
-| tensor parallel | `GPU=0,1` | a strong CPU (16+ cores). `BASE_GB` and `KV_GB` are per GPU. |
-| helper GPU | `GPU=0 HELPER_GPU=1 HELPER_GB=20` | an 8-core CPU, or 24 GB cards. The helper caches the hot experts the main GPU does not hold and computes them. No P2P or NVLink needed. |
+| tensor parallel | `GPU=0,1` | a strong CPU (16+ cores), or two 16 GB cards. `BASE_GB` and `KV_GB` are per GPU. |
+| helper GPU | `GPU=0 HELPER_GPU=1 HELPER_GB=20` | an 8-core CPU, or a 24 GB main card. The helper caches the hot experts the main GPU does not hold and computes them. No P2P or NVLink needed. |
 
 `HELPER_GB` is the helper's expert cache: about 20 on a 24 GB card, 40 on a 48 GB card.
 
@@ -68,8 +69,10 @@ GSM8K-50, one stream (decode tok/s):
 | 2× RTX PRO 6000 96 GB (`BASE_GB=65.5`) | EPYC 9534, 64 cores | 75.5 | **93.1** | |
 | 2× RTX A6000 48 GB (`BASE_GB=24`) | EPYC 7F32, 8 cores | 22.1 | 11.8 | **26.7** |
 | 2× 24 GB (A6000 limited to 24 GB, `BASE_GB=7`) | EPYC 7F32, 8 cores | 16.8 | 12.5 | **21.7** |
+| 2× 16 GB (H200 limited to 16 GB, `BASE_GB=3.5`) | Threadripper PRO 7965WX, 24 cores | – | **36.6** | |
 
-With 8 cores, tensor parallel is slower than one GPU: each GPU gets half of the CPU.
+With 8 cores, tensor parallel is slower than one GPU: each GPU gets half of the CPU. With a strong CPU the helper does
+not pay: a third 16 GB card as helper for tensor parallel (`GPU=0,1 HELPER_GPU=2`) ran 32.8 against 36.6 without it.
 
 ## Install
 
@@ -106,6 +109,9 @@ tandem-serve MODEL=~/models/v41-tandem BASE_GB=11 KV_GB=1 STEP_T=2 RAM_GB=90 ENG
 
 # two 24 GB cards (RTX 3090 / 4090) + 128 GB RAM: main GPU 0, helper GPU 1
 tandem-serve MODEL=~/models/v41-tandem BASE_GB=7 KV_GB=2 STEP_T=8 CHUNK=2048 RAM_GB=90 ENGRAM=files HELPER_GPU=1 HELPER_GB=20
+
+# two 16 GB cards (RTX 5080 / 5070 Ti) + 256 GB RAM: tensor parallel
+tandem-serve MODEL=~/models/v41-tandem GPU=0,1 BASE_GB=3.5 KV_GB=1 STEP_T=8 CHUNK=1024
 
 # 48 GB card (RTX A6000 / 6000 Ada)
 tandem-serve MODEL=~/models/v41-tandem BASE_GB=24 KV_GB=2 STEP_T=8
@@ -189,7 +195,7 @@ format refuses to boot with a message to upgrade. Engine and package versions ar
 
 ## Models
 
-| model | status in 0.2.0 |
+| model | status in 0.2.1 |
 |---|---|
 | DeepSeek-V4.1-Flash-1017, Tandem VQ2 package | supported (this release) |
 | DeepSeek-V4-Flash | runs on the engine with plain 2-bit experts; not packaged or validated |
@@ -212,7 +218,14 @@ quality setting from VQ + FP4 top 52 up to all-FP4.
   stores, the helper GPU, portable expert kernels for SM90/SM89/SM86, and the port to vLLM 0.31 / DeepSeek-V4.1
   (SM120 attention fixes; split-KV sparse-MLA below SM90).
 
-## Changes since 0.1.1
+## Changes in 0.2.1
+
+- Two 16 GB cards in tensor parallel (the pool floor counts each GPU's own experts).
+- `HELPER_GPU` also works with `GPU=0,1`: each GPU uses the helper for its own experts.
+- Fixed: `HELPER_GPU` without `RAM_GB` (all experts pinned) turned the helper and the CPU experts off; a helper that
+  fails to start now leaves the CPU experts on.
+
+## Changes in 0.2.0
 
 - GPUs: Hopper (SM90), Ada (SM89) and Ampere (SM86) on portable expert kernels with a boot parity check; V4.1
   sparse-MLA attention below SM90 through a Triton port with split-KV decode (+17% on an A6000).
@@ -229,7 +242,7 @@ quality setting from VQ + FP4 top 52 up to all-FP4.
 - The installer links `tandem-serve` into `~/.local/bin`.
 - One-user lines for 32 GB cards in the quick start.
 
-## Not in 0.2.0
+## Not in 0.2.1
 - AMD GPUs, V100 (SM70), and more than two GPUs as a tested setup.
 - Models other than DeepSeek-V4.1-Flash (see [Models](#models)).
 - Original-precision experts on the CPU (see [Models](#models)).

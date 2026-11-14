@@ -4605,7 +4605,22 @@ def _moe_w2_forward_timed(
         hsplit = moe_w2_cpu.helper_split(layer_key, T)
     if hsplit:
         full_ids, full_w = topk_ids, topk_weights
-    if moe_w2_ep.active():
+    if moe_w2_ep.active() and hsplit:
+        # tensor parallel + helper split: this rank's routes only (EP
+        # remap), then its helper's experts leave the main GPU's GEMMs;
+        # request() gets the rank's full routing (other ranks' routes at
+        # weight 0 on the EP fallback, which the helper never holds)
+        full_w, full_ids, ep_map = moe_w2_ep.remap(
+            layer_key, topk_weights, topk_ids, st["E"])
+        h_own, h_fb = moe_w2_cpu.helper_own(layer_key)
+        topk_weights, h_ids, _h_map = moe_w2_helper.remap(
+            h_own, h_fb, full_w, full_ids)
+        emap = torch.where(h_own == 0, ep_map, torch.full_like(ep_map, -1))
+        sorted_ids, expert_blocks, num_post = moe_align_block_size(
+            topk_ids, mblock, st["E"], expert_map=emap,
+            ignore_invalid_experts=True)
+        topk_ids = h_ids
+    elif moe_w2_ep.active():
         # own experts only: other ranks' routes are dropped from the GEMMs
         # (expert_map -1) and carry weight 0; the ids that feed seen /
         # fetch / CPU paths point those routes at a hot own expert
